@@ -523,6 +523,88 @@ struct if_sffpage {
 	uint8_t		 sff_data[IFSFF_DATA_LEN];	/* k -> u */
 };
 
+/* SIOCGIFNVM */
+
+#define IFNVM_MAX_WORDS		(64 * 1024 / 2)	/* full NVM (32K words) */
+
+struct if_nvmdata {
+	char		 nvm_ifname[IFNAMSIZ];		/* u -> k */
+	uint16_t	 nvm_offset;			/* u -> k: word offset */
+	uint16_t	 nvm_words;			/* u -> k: word count */
+	uint16_t	*nvm_data;			/* k -> u: caller buffer */
+};
+
+/* SIOCSIFNVMOPEN / SIOCSIFNVMCLOSE */
+
+#define IFNVM_ACCESS_READ	1
+#define IFNVM_ACCESS_WRITE	2
+
+struct if_nvmsess {
+	char		 ns_ifname[IFNAMSIZ];		/* u -> k */
+	uint8_t		 ns_access;			/* u -> k: IFNVM_ACCESS_* */
+	uint8_t		 ns_pad[3];
+};
+
+/* SIOCSIFNVMCMD */
+
+#define IFNVM_CMD_MAX_BUFLEN	4096	/* per-AQ-command data limit */
+
+/* nc_flags bits */
+#define IFNVM_CMD_F_WAIT_ARQ	0x0001	/* wait for async ARQ completion */
+
+/*
+ * Admin-queue opcodes permitted through SIOCSIFNVMCMD (nc_opcode).
+ * The kernel rejects any opcode not in this set, so the command channel
+ * is a constrained NVM-management interface, not a generic firmware
+ * passthrough.  These values are shared by the i40e (ixl) and ice
+ * (E810/E830) admin queues; resource acquire/release (0x0008/0x0009)
+ * are issued by the kernel during a session, not by userland, and so
+ * are deliberately NOT reachable here.
+ */
+#define IFNVM_OP_NVM_READ		0x0701
+#define IFNVM_OP_NVM_ERASE		0x0702
+#define IFNVM_OP_NVM_WRITE		0x0703	/* a.k.a. NVM_UPDATE (i40e) */
+#define IFNVM_OP_NVM_CFG_READ		0x0704
+#define IFNVM_OP_NVM_CFG_WRITE		0x0705
+#define IFNVM_OP_NVM_CHECKSUM		0x0706
+#define IFNVM_OP_NVM_WRITE_ACTIVATE	0x0707	/* ice (E810) bank activate */
+#define IFNVM_OP_NVM_UPDATE_EMPR		0x0709	/* ice (E810) EMP reset */
+
+struct if_nvmcmd {
+	char		 nc_ifname[IFNAMSIZ];		/* u -> k */
+	uint16_t	 nc_opcode;			/* u -> k: AQ opcode */
+	uint16_t	 nc_retval;			/* k -> u: AQ retval */
+	uint8_t		 nc_module;			/* u -> k: AQ byte 17 */
+	uint8_t		 nc_cmdflags;			/* u -> k: AQ byte 16 */
+	uint16_t	 nc_flags;			/* u -> k: IFNVM_CMD_F_* */
+	uint32_t	 nc_offset;			/* u -> k: AQ bytes 20-23 */
+	uint16_t	 nc_aqlen;			/* u<->k: AQ bytes 18-19 */
+	uint16_t	 nc_buflen;			/* u -> k: data buffer length */
+	uint16_t	 nc_timeout_ms;			/* u -> k: ARQ timeout */
+	uint16_t	 nc_pad;
+	void		*nc_buf;			/* k <-> u: data buffer */
+};
+
+/* SIOCGIFFWVER: running firmware version (cached at driver attach
+ * from AQ Get Version, opcode 0x0001).  Reflects what dmesg's
+ * "FW X.Y.NNNNN" prints, separately from any NVM image version.
+ */
+struct if_fwver {
+	char		 fv_ifname[IFNAMSIZ];		/* u -> k */
+	uint16_t	 fv_fw_major;			/* k -> u */
+	uint16_t	 fv_fw_minor;			/* k -> u */
+	uint32_t	 fv_fw_build;			/* k -> u */
+	uint16_t	 fv_api_major;			/* k -> u */
+	uint16_t	 fv_api_minor;			/* k -> u */
+	/* PCIe bus:dev identifies the physical card; the function
+	 * number differs per port.  Use (bus,dev) as a card key to
+	 * group ports of the same chip. */
+	uint16_t	 fv_pci_bus;			/* k -> u */
+	uint16_t	 fv_pci_dev;			/* k -> u */
+	uint16_t	 fv_pci_func;			/* k -> u */
+	uint16_t	 fv_pad;
+};
+
 #include <net/if_arp.h>
 
 #ifdef _KERNEL

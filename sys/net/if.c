@@ -139,6 +139,12 @@ int	ifioctl_get(u_long, caddr_t);
 int	ifconf(caddr_t);
 static int
 	if_sffpage_check(const caddr_t);
+static int
+	if_nvmdata_check(const caddr_t);
+static int
+	if_nvmsess_check(const caddr_t);
+static int
+	if_nvmcmd_check(const caddr_t);
 
 int	if_getgroup(caddr_t, struct ifnet *);
 int	if_getgroupmembers(caddr_t);
@@ -2484,6 +2490,73 @@ forceup:
 		error = ((*ifp->if_ioctl)(ifp, cmd, data));
 		break;
 
+	case SIOCGIFNVM:
+		error = suser(p);
+		if (error != 0)
+			break;
+
+		error = if_nvmdata_check(data);
+		if (error != 0)
+			break;
+
+		/* don't take NET_LOCK because NVM reads take a long time */
+		error = ((*ifp->if_ioctl)(ifp, cmd, data));
+		break;
+
+	case SIOCSIFNVMOPEN: {
+		const struct if_nvmsess *ns = (const struct if_nvmsess *)data;
+
+		error = suser(p);
+		if (error != 0)
+			break;
+
+		error = if_nvmsess_check(data);
+		if (error != 0)
+			break;
+
+		/*
+		 * Writing firmware to the NIC must not be possible while the
+		 * system is running normally and reachable over the network:
+		 * a privileged remote attacker could otherwise flash malicious
+		 * firmware.  Allow opening a write session only at securelevel
+		 * <= 0, i.e. single-user mode, which is administered from the
+		 * local console and does not start network services.  Read
+		 * sessions are always permitted.
+		 */
+		if (ns->ns_access == IFNVM_ACCESS_WRITE && securelevel > 0) {
+			error = EPERM;
+			break;
+		}
+
+		error = ((*ifp->if_ioctl)(ifp, cmd, data));
+		break;
+	}
+
+	case SIOCSIFNVMCLOSE:
+		error = suser(p);
+		if (error != 0)
+			break;
+
+		error = ((*ifp->if_ioctl)(ifp, cmd, data));
+		break;
+
+	case SIOCSIFNVMCMD:
+		error = suser(p);
+		if (error != 0)
+			break;
+
+		error = if_nvmcmd_check(data);
+		if (error != 0)
+			break;
+
+		error = ((*ifp->if_ioctl)(ifp, cmd, data));
+		break;
+
+	case SIOCGIFFWVER:
+		/* read-only; no suser() required */
+		error = ((*ifp->if_ioctl)(ifp, cmd, data));
+		break;
+
 	case SIOCSIFMEDIA:
 		if ((error = suser(p)) != 0)
 			break;
@@ -2721,6 +2794,69 @@ if_sffpage_check(const caddr_t data)
 	default:
 		return (EINVAL);
 	}
+
+	return (0);
+}
+
+static int
+if_nvmdata_check(const caddr_t data)
+{
+	const struct if_nvmdata *nvm = (const struct if_nvmdata *)data;
+
+	if (nvm->nvm_words == 0 || nvm->nvm_data == NULL)
+		return (EINVAL);
+	if (nvm->nvm_words > IFNVM_MAX_WORDS)
+		return (EINVAL);
+	if ((uint32_t)nvm->nvm_offset + nvm->nvm_words > IFNVM_MAX_WORDS)
+		return (EINVAL);
+
+	return (0);
+}
+
+static int
+if_nvmsess_check(const caddr_t data)
+{
+	const struct if_nvmsess *ns = (const struct if_nvmsess *)data;
+
+	switch (ns->ns_access) {
+	case IFNVM_ACCESS_READ:
+	case IFNVM_ACCESS_WRITE:
+		return (0);
+	}
+	return (EINVAL);
+}
+
+static int
+if_nvmcmd_check(const caddr_t data)
+{
+	const struct if_nvmcmd *nc = (const struct if_nvmcmd *)data;
+
+	/*
+	 * Allowlist the admin-queue opcode: only NVM-management commands
+	 * may be issued through this channel.  This keeps it from being a
+	 * generic "run any firmware command" passthrough and is enforced
+	 * here, in MI code, so every driver inherits the same policy.
+	 */
+	switch (nc->nc_opcode) {
+	case IFNVM_OP_NVM_READ:
+	case IFNVM_OP_NVM_ERASE:
+	case IFNVM_OP_NVM_WRITE:
+	case IFNVM_OP_NVM_CFG_READ:
+	case IFNVM_OP_NVM_CFG_WRITE:
+	case IFNVM_OP_NVM_CHECKSUM:
+	case IFNVM_OP_NVM_WRITE_ACTIVATE:
+	case IFNVM_OP_NVM_UPDATE_EMPR:
+		break;
+	default:
+		return (EINVAL);
+	}
+
+	if (nc->nc_buflen > IFNVM_CMD_MAX_BUFLEN)
+		return (EINVAL);
+	if (nc->nc_buflen != 0 && nc->nc_buf == NULL)
+		return (EINVAL);
+	if ((nc->nc_flags & ~IFNVM_CMD_F_WAIT_ARQ) != 0)
+		return (EINVAL);
 
 	return (0);
 }

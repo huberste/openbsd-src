@@ -193,6 +193,13 @@ struct ixl_aq_desc {
 #define IXL_AQ_OP_PHY_SET_EVENT_MASK	0x0613
 #define IXL_AQ_OP_PHY_SET_REGISTER	0x0628
 #define IXL_AQ_OP_PHY_GET_REGISTER	0x0629
+#define IXL_AQ_OP_NVM_READ		0x0701
+#define IXL_AQ_OP_NVM_ERASE		0x0702
+#define IXL_AQ_OP_NVM_UPDATE		0x0703
+#define IXL_AQ_OP_NVM_CFG_READ		0x0704
+#define IXL_AQ_OP_NVM_CFG_WRITE		0x0705
+#define IXL_AQ_OP_NVM_RESERVED		0x0706
+#define IXL_AQ_OP_NVM_ROLLBACK		0x0707
 #define IXL_AQ_OP_LLDP_GET_MIB		0x0a00
 #define IXL_AQ_OP_LLDP_MIB_CHG_EV	0x0a01
 #define IXL_AQ_OP_LLDP_ADD_TLV		0x0a02
@@ -206,6 +213,19 @@ struct ixl_aq_desc {
 #define IXL_AQ_OP_SET_RSS_LUT		0x0b03 /* 722 only */
 #define IXL_AQ_OP_GET_RSS_KEY		0x0b04 /* 722 only */
 #define IXL_AQ_OP_GET_RSS_LUT		0x0b05 /* 722 only */
+/* Shared resource IDs (datasheet table 7-213) */
+#define IXL_AQ_RESOURCE_NVM			0x0001
+#define IXL_AQ_RESOURCE_SDP			0x0002
+/* Shared resource access types */
+#define IXL_AQ_RESOURCE_READ			0x0001
+#define IXL_AQ_RESOURCE_WRITE			0x0002
+/* Default timeouts in ms (datasheet table 7-213) */
+#define IXL_AQ_RESOURCE_NVM_READ_TIMEOUT	  3000
+#define IXL_AQ_RESOURCE_NVM_WRITE_TIMEOUT	180000
+
+/* NVM_READ command flags (byte 16 of NVM read AQ command) */
+#define IXL_AQ_NVM_LAST_COMMAND			(1 << 0)
+#define IXL_AQ_NVM_FLASH_ONLY			(1 << 7)
 
 struct ixl_aq_mac_addresses {
 	uint8_t		pf_lan[ETHER_ADDR_LEN];
@@ -1220,6 +1240,12 @@ struct ixl_softc {
 
 	uint16_t		 sc_api_major;
 	uint16_t		 sc_api_minor;
+	uint16_t		 sc_fw_major;
+	uint16_t		 sc_fw_minor;
+	uint32_t		 sc_fw_build;
+	int			 sc_pci_bus;
+	int			 sc_pci_dev;
+	int			 sc_pci_func;
 	uint8_t			 sc_pf_id;
 	uint16_t		 sc_uplink_seid;	/* le */
 	uint16_t		 sc_downlink_seid;	/* le */
@@ -1265,6 +1291,22 @@ struct ixl_softc {
 	struct rwlock		 sc_cfg_lock;
 	unsigned int		 sc_dead;
 
+	/* NVM session state (guarded by ixl_nvm_lock) */
+	pid_t			 sc_nvm_pid;	/* 0 = no session */
+	uint8_t			 sc_nvm_access;
+
+	/*
+	 * NVM async event slot: any NVM ARQ event delivers to the
+	 * single in-flight SIOCSIFNVMCMD waiter for this softc.  The
+	 * counter is monotonic-and-nonzero so it doubles as an active-
+	 * waiter flag; cookie matching is not used because the chip
+	 * does not reliably echo the cookie on NVM completion events.
+	 */
+	struct mutex		 sc_nvm_arq_mtx;
+	uint64_t		 sc_nvm_arq_cookie;	/* 0 = no waiter */
+	int			 sc_nvm_arq_valid;	/* 1 = event arrived */
+	struct ixl_aq_desc	 sc_nvm_arq_event;
+
 	uint8_t			 sc_enaddr[ETHER_ADDR_LEN];
 
 #if NKSTAT > 0
@@ -1284,6 +1326,10 @@ static int	ixl_pf_reset(struct ixl_softc *);
 static int	ixl_dmamem_alloc(struct ixl_softc *, struct ixl_dmamem *,
 		    bus_size_t, u_int);
 static void	ixl_dmamem_free(struct ixl_softc *, struct ixl_dmamem *);
+
+static int	ixl_resource_acquire(struct ixl_softc *, uint16_t, uint16_t,
+		    uint32_t, uint32_t);
+static int	ixl_resource_release(struct ixl_softc *, uint16_t, uint32_t);
 
 static int	ixl_arq_fill(struct ixl_softc *);
 static void	ixl_arq_unfill(struct ixl_softc *);
@@ -1365,6 +1411,7 @@ static void	ixl_rxfill(struct ixl_softc *, struct ixl_rx_ring *);
 static void	ixl_rxrefill(void *);
 static int	ixl_rxrinfo(struct ixl_softc *, struct if_rxrinfo *);
 static void	ixl_rx_checksum(struct mbuf *, uint64_t);
+static int	ixl_nvm_read(struct ixl_softc *, uint16_t, uint16_t, uint16_t *);
 
 #if NKSTAT > 0
 static void	ixl_kstat_attach(struct ixl_softc *);
@@ -1485,6 +1532,7 @@ ixl_aq_dva(struct ixl_aq_desc *iaq, bus_addr_t addr)
 #endif
 
 static struct rwlock ixl_sff_lock = RWLOCK_INITIALIZER("ixlsff");
+static struct rwlock ixl_nvm_lock = RWLOCK_INITIALIZER("ixlnvm");
 
 /* deal with differences between chips */
 
@@ -1650,6 +1698,8 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
 	sc->sc_dmat = pa->pa_dmat;
+	pci_decompose_tag(pa->pa_pc, pa->pa_tag,
+	    &sc->sc_pci_bus, &sc->sc_pci_dev, &sc->sc_pci_func);
 	sc->sc_aq_regs = &ixl_pf_aq_regs;
 
 	sc->sc_nqueues = 0; /* 1 << 0 is 1 queue */
@@ -1691,6 +1741,7 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	/* initialise the adminq */
 
 	mtx_init(&sc->sc_atq_mtx, IPL_NET);
+	mtx_init(&sc->sc_nvm_arq_mtx, IPL_NET);
 
 	if (ixl_dmamem_alloc(sc, &sc->sc_atq,
 	    sizeof(struct ixl_aq_desc) * IXL_AQ_NUM, IXL_AQ_ALIGN) != 0) {
@@ -2144,6 +2195,286 @@ ixl_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		error = ixl_get_sffpage(sc, (struct if_sffpage *)data);
 		rw_exit(&ixl_sff_lock);
 		break;
+
+	case SIOCGIFFWVER: {
+		struct if_fwver *fv = (struct if_fwver *)data;
+
+		fv->fv_fw_major = sc->sc_fw_major;
+		fv->fv_fw_minor = sc->sc_fw_minor;
+		fv->fv_fw_build = sc->sc_fw_build;
+		fv->fv_api_major = sc->sc_api_major;
+		fv->fv_api_minor = sc->sc_api_minor;
+		fv->fv_pci_bus = (uint16_t)sc->sc_pci_bus;
+		fv->fv_pci_dev = (uint16_t)sc->sc_pci_dev;
+		fv->fv_pci_func = (uint16_t)sc->sc_pci_func;
+		break;
+	}
+
+	case SIOCGIFNVM: {
+		struct if_nvmdata *nvm = (struct if_nvmdata *)data;
+		uint16_t *buf;
+		size_t buflen = nvm->nvm_words * sizeof(uint16_t);
+
+		buf = mallocarray(nvm->nvm_words, sizeof(uint16_t), M_DEVBUF,
+		    M_WAITOK | M_ZERO);
+
+		error = rw_enter(&ixl_nvm_lock, RW_WRITE | RW_INTR);
+		if (error != 0) {
+			free(buf, M_DEVBUF, buflen);
+			break;
+		}
+		if (sc->sc_nvm_pid != 0 &&
+		    prfind(sc->sc_nvm_pid) != NULL) {
+			rw_exit(&ixl_nvm_lock);
+			free(buf, M_DEVBUF, buflen);
+			error = EBUSY;
+			break;
+		}
+		error = ixl_nvm_read(sc, nvm->nvm_offset, nvm->nvm_words, buf);
+		rw_exit(&ixl_nvm_lock);
+
+		if (error == 0)
+			error = copyout(buf, nvm->nvm_data, buflen);
+		free(buf, M_DEVBUF, buflen);
+		break;
+	}
+
+	case SIOCSIFNVMOPEN: {
+		const struct if_nvmsess *ns = (struct if_nvmsess *)data;
+		uint16_t access, timeout;
+
+		if (ns->ns_access == IFNVM_ACCESS_READ) {
+			access = IXL_AQ_RESOURCE_READ;
+			timeout = IXL_AQ_RESOURCE_NVM_READ_TIMEOUT;
+		} else {
+			access = IXL_AQ_RESOURCE_WRITE;
+			timeout = IXL_AQ_RESOURCE_NVM_WRITE_TIMEOUT;
+		}
+
+		error = rw_enter(&ixl_nvm_lock, RW_WRITE | RW_INTR);
+		if (error != 0)
+			break;
+		if (sc->sc_nvm_pid != 0 &&
+		    prfind(sc->sc_nvm_pid) != NULL) {
+			rw_exit(&ixl_nvm_lock);
+			error = EBUSY;
+			break;
+		}
+		error = ixl_resource_acquire(sc, IXL_AQ_RESOURCE_NVM,
+		    access, timeout, 0);
+		if (error == 0) {
+			sc->sc_nvm_pid = curproc->p_p->ps_pid;
+			sc->sc_nvm_access = ns->ns_access;
+		}
+		rw_exit(&ixl_nvm_lock);
+		break;
+	}
+
+	case SIOCSIFNVMCLOSE:
+		error = rw_enter(&ixl_nvm_lock, RW_WRITE | RW_INTR);
+		if (error != 0)
+			break;
+		if (sc->sc_nvm_pid == 0) {
+			rw_exit(&ixl_nvm_lock);
+			error = ENOENT;
+			break;
+		}
+		if (sc->sc_nvm_pid != curproc->p_p->ps_pid &&
+		    prfind(sc->sc_nvm_pid) != NULL) {
+			rw_exit(&ixl_nvm_lock);
+			error = EPERM;
+			break;
+		}
+		(void)ixl_resource_release(sc, IXL_AQ_RESOURCE_NVM, 0);
+		sc->sc_nvm_pid = 0;
+		sc->sc_nvm_access = 0;
+		rw_exit(&ixl_nvm_lock);
+		break;
+
+	case SIOCSIFNVMCMD: {
+		struct if_nvmcmd *nc = (struct if_nvmcmd *)data;
+		struct ixl_aq_desc iaq;
+		struct ixl_dmamem idm;
+		uint16_t aqflags;
+		uint64_t cookie = 0;
+		int have_buf, write_buf;
+		int dma_alloced = 0;
+		int do_wait = (nc->nc_flags & IFNVM_CMD_F_WAIT_ARQ) != 0;
+
+		/* Opcode allowlist and buffer-direction table. */
+		switch (nc->nc_opcode) {
+		case IXL_AQ_OP_NVM_READ:
+		case IXL_AQ_OP_NVM_CFG_READ:
+			write_buf = 0;	/* chip -> host */
+			have_buf = (nc->nc_buflen != 0);
+			break;
+		case IXL_AQ_OP_NVM_UPDATE:
+		case IXL_AQ_OP_NVM_CFG_WRITE:
+			write_buf = 1;	/* host -> chip */
+			have_buf = (nc->nc_buflen != 0);
+			break;
+		case IXL_AQ_OP_NVM_ERASE:
+		case IXL_AQ_OP_NVM_ROLLBACK:
+			write_buf = 0;
+			have_buf = 0;
+			break;
+		default:
+			error = EOPNOTSUPP;
+			break;
+		}
+		if (error != 0)
+			break;
+		if (have_buf && nc->nc_buf == NULL) {
+			error = EINVAL;
+			break;
+		}
+
+		error = rw_enter(&ixl_nvm_lock, RW_WRITE | RW_INTR);
+		if (error != 0)
+			break;
+		if (sc->sc_nvm_pid != curproc->p_p->ps_pid) {
+			rw_exit(&ixl_nvm_lock);
+			error = EPERM;
+			break;
+		}
+		if (write_buf && sc->sc_nvm_access != IFNVM_ACCESS_WRITE) {
+			rw_exit(&ixl_nvm_lock);
+			error = EPERM;
+			break;
+		}
+
+		if (have_buf) {
+			if (ixl_dmamem_alloc(sc, &idm, nc->nc_buflen, 0)
+			    != 0) {
+				rw_exit(&ixl_nvm_lock);
+				error = ENOMEM;
+				break;
+			}
+			dma_alloced = 1;
+			if (write_buf) {
+				error = copyin(nc->nc_buf,
+				    IXL_DMA_KVA(&idm), nc->nc_buflen);
+				if (error != 0)
+					goto cmd_done;
+			}
+		}
+
+		aqflags = 0;
+		if (have_buf) {
+			aqflags = IXL_AQ_BUF;
+			if (nc->nc_buflen > I40E_AQ_LARGE_BUF)
+				aqflags |= IXL_AQ_LB;
+			if (write_buf)
+				aqflags |= IXL_AQ_RD;
+		}
+		/*
+		 * Datasheet 3.4.5.4 / 3.4.5.5 / 3.4.5.6: in a multi-step
+		 * NVM_UPDATE/NVM_ERASE sequence the FE (Flush on Error)
+		 * bit must be set on every command except the LAST one,
+		 * so the chip discards the remaining queued commands if
+		 * any single command fails.  Set it automatically based
+		 * on the absence of LAST_COMMAND in nc_cmdflags.
+		 */
+		if ((nc->nc_opcode == IXL_AQ_OP_NVM_UPDATE ||
+		     nc->nc_opcode == IXL_AQ_OP_NVM_ERASE ||
+		     nc->nc_opcode == IXL_AQ_OP_NVM_CFG_WRITE) &&
+		    !(nc->nc_cmdflags & IXL_AQ_NVM_LAST_COMMAND))
+			aqflags |= IXL_AQ_FE;
+
+		/* Reserve an ARQ event slot if the caller will wait. */
+		if (do_wait) {
+			mtx_enter(&sc->sc_nvm_arq_mtx);
+			do {
+				sc->sc_nvm_arq_cookie++;
+			} while (sc->sc_nvm_arq_cookie == 0);
+			cookie = sc->sc_nvm_arq_cookie;
+			sc->sc_nvm_arq_valid = 0;
+			mtx_leave(&sc->sc_nvm_arq_mtx);
+		}
+
+		memset(&iaq, 0, sizeof(iaq));
+		iaq.iaq_flags = htole16(aqflags);
+		iaq.iaq_opcode = htole16(nc->nc_opcode);
+		iaq.iaq_datalen = htole16(nc->nc_buflen);
+		iaq.iaq_cookie = cookie;
+		iaq.iaq_param[0] = htole32((uint32_t)nc->nc_cmdflags |
+		    ((uint32_t)nc->nc_module << 8) |
+		    ((uint32_t)nc->nc_aqlen << 16));
+		iaq.iaq_param[1] = htole32(nc->nc_offset);
+		if (have_buf)
+			ixl_aq_dva(&iaq, IXL_DMA_DVA(&idm));
+
+		if (have_buf) {
+			bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(&idm),
+			    0, IXL_DMA_LEN(&idm), write_buf ?
+			    BUS_DMASYNC_PREWRITE : BUS_DMASYNC_PREREAD);
+		}
+		error = ixl_atq_poll(sc, &iaq, 2000);
+		if (have_buf) {
+			bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(&idm),
+			    0, IXL_DMA_LEN(&idm), write_buf ?
+			    BUS_DMASYNC_POSTWRITE : BUS_DMASYNC_POSTREAD);
+		}
+
+		nc->nc_retval = le16toh(iaq.iaq_retval);
+		nc->nc_aqlen = (le32toh(iaq.iaq_param[0]) >> 16) & 0xffff;
+		if (error != 0)
+			goto cmd_done;
+		if (iaq.iaq_retval != htole16(IXL_AQ_RC_OK)) {
+			/*
+			 * The chip-level failure is reported via nc_retval;
+			 * the ioctl itself succeeded (delivered the command,
+			 * got a response). Userland must check nc_retval.
+			 */
+			goto cmd_done;
+		}
+
+		if (do_wait) {
+			uint16_t to_ms = nc->nc_timeout_ms;
+			uint64_t to_ns;
+
+			if (to_ms == 0)
+				to_ms = 30000;	/* 30 s default */
+			to_ns = (uint64_t)to_ms * 1000000ULL;
+
+			mtx_enter(&sc->sc_nvm_arq_mtx);
+			while (!sc->sc_nvm_arq_valid) {
+				error = msleep_nsec(&sc->sc_nvm_arq_valid,
+				    &sc->sc_nvm_arq_mtx, PRIBIO | PCATCH,
+				    "ixlnvm", to_ns);
+				if (error != 0)
+					break;
+			}
+			if (error == 0) {
+				nc->nc_retval = le16toh(
+				    sc->sc_nvm_arq_event.iaq_retval);
+				nc->nc_aqlen = (le32toh(
+				    sc->sc_nvm_arq_event.iaq_param[0]) >> 16)
+				    & 0xffff;
+			}
+			sc->sc_nvm_arq_cookie = 0;
+			sc->sc_nvm_arq_valid = 0;
+			mtx_leave(&sc->sc_nvm_arq_mtx);
+			if (error != 0)
+				goto cmd_done;
+			if (sc->sc_nvm_arq_event.iaq_retval !=
+			    htole16(IXL_AQ_RC_OK)) {
+				/* chip reported failure via nc_retval */
+				goto cmd_done;
+			}
+		}
+
+		if (!write_buf && have_buf) {
+			error = copyout(IXL_DMA_KVA(&idm), nc->nc_buf,
+			    nc->nc_buflen);
+		}
+
+ cmd_done:
+		if (dma_alloced)
+			ixl_dmamem_free(sc, &idm);
+		rw_exit(&ixl_nvm_lock);
+		break;
+	}
 
 	default:
 		error = ether_ioctl(ifp, &sc->sc_ac, cmd, data);
@@ -3604,6 +3935,28 @@ ixl_arq(void *xsc)
 		case HTOLE16(IXL_AQ_OP_PHY_LINK_STATUS):
 			ixl_link_state_update_iaq(sc, iaq);
 			break;
+		case HTOLE16(IXL_AQ_OP_NVM_READ):
+		case HTOLE16(IXL_AQ_OP_NVM_ERASE):
+		case HTOLE16(IXL_AQ_OP_NVM_UPDATE):
+		case HTOLE16(IXL_AQ_OP_NVM_CFG_READ):
+		case HTOLE16(IXL_AQ_OP_NVM_CFG_WRITE):
+		case HTOLE16(IXL_AQ_OP_NVM_ROLLBACK):
+			/*
+			 * Observed: the chip does not echo our cookie back
+			 * on the NVM_UPDATE completion event despite the
+			 * datasheet (3.4.10.3) saying it would.  We rely on
+			 * the session model (single waiter per softc) and
+			 * deliver any pending NVM event to the active
+			 * waiter rather than matching by cookie.
+			 */
+			mtx_enter(&sc->sc_nvm_arq_mtx);
+			if (sc->sc_nvm_arq_cookie != 0) {
+				sc->sc_nvm_arq_event = *iaq;
+				sc->sc_nvm_arq_valid = 1;
+				wakeup(&sc->sc_nvm_arq_valid);
+			}
+			mtx_leave(&sc->sc_nvm_arq_mtx);
+			break;
 		}
 
 		memset(iaq, 0, sizeof(*iaq));
@@ -3803,14 +4156,101 @@ ixl_get_version(struct ixl_softc *sc)
 	fwver = lemtoh32(&iaq.iaq_param[2]);
 	apiver = lemtoh32(&iaq.iaq_param[3]);
 
+	sc->sc_fw_major = fwver & 0xffff;
+	sc->sc_fw_minor = (fwver >> 16) & 0xffff;
+	sc->sc_fw_build = fwbuild;
 	sc->sc_api_major = apiver & 0xffff;
 	sc->sc_api_minor = (apiver >> 16) & 0xffff;
 
-	printf(", FW %hu.%hu.%05u API %hu.%hu", (uint16_t)fwver,
-	    (uint16_t)(fwver >> 16), fwbuild,
+	printf(", FW %hu.%hu.%05u API %hu.%hu",
+	    sc->sc_fw_major, sc->sc_fw_minor, sc->sc_fw_build,
 	    sc->sc_api_major, sc->sc_api_minor);
 
 	return (0);
+}
+
+/*
+ * Read words from the NVM (Flash) of an Intel 700-series controller into
+ * a kernel buffer.  Issues NVM Read admin commands (opcode 0x0701) in
+ * chunks of up to 4 KB, as required by the datasheet (see Intel Ethernet
+ * Controller X710/XXV710/XL710 datasheet, sections 3.4.10.1 and 7.10.2).
+ *
+ * Caller must hold ixl_nvm_lock.
+ */
+static int
+ixl_nvm_read(struct ixl_softc *sc, uint16_t woffset, uint16_t nwords,
+    uint16_t *buf)
+{
+	struct ixl_aq_desc iaq;
+	struct ixl_dmamem idm;
+	const uint16_t bufsz = MIN(IXL_AQ_BUFLEN, nwords * sizeof(uint16_t));
+	uint16_t done = 0;
+	int rv;
+
+	rv = ixl_resource_acquire(sc, IXL_AQ_RESOURCE_NVM,
+	    IXL_AQ_RESOURCE_READ, IXL_AQ_RESOURCE_NVM_READ_TIMEOUT, 0);
+	if (rv != 0)
+		return (rv);
+
+	if (ixl_dmamem_alloc(sc, &idm, bufsz, 0) != 0) {
+		rv = ENOMEM;
+		goto release;
+	}
+
+	while (done < nwords) {
+		const uint16_t chunk = MIN(nwords - done,
+		    bufsz / sizeof(uint16_t));
+		const uint16_t len = chunk * sizeof(uint16_t);
+		uint32_t byteoff = ((uint32_t)woffset + done) * sizeof(uint16_t);
+		uint8_t cmdflags = 0;
+		uint16_t aqflags = IXL_AQ_BUF;
+
+		if (done + chunk >= nwords)
+			cmdflags |= IXL_AQ_NVM_LAST_COMMAND;
+		if (len > I40E_AQ_LARGE_BUF)
+			aqflags |= IXL_AQ_LB;
+
+		memset(&iaq, 0, sizeof(iaq));
+		iaq.iaq_flags = htole16(aqflags);
+		iaq.iaq_opcode = htole16(IXL_AQ_OP_NVM_READ);
+		iaq.iaq_datalen = htole16(len);
+		/*
+		 * Command bytes 16-19 (param[0], LE):
+		 *   byte 16    = Command Flags
+		 *   byte 17    = Module Pointer (0 = flat Flash)
+		 *   bytes 18-19 = Length in bytes
+		 */
+		iaq.iaq_param[0] = htole32(cmdflags | ((uint32_t)len << 16));
+		/* Bytes 20-23: byte offset (only 22:20 used, 23 reserved). */
+		iaq.iaq_param[1] = htole32(byteoff);
+		ixl_aq_dva(&iaq, IXL_DMA_DVA(&idm));
+
+		bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(&idm),
+		    0, IXL_DMA_LEN(&idm), BUS_DMASYNC_PREREAD);
+
+		rv = ixl_atq_poll(sc, &iaq, 2000);
+
+		bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(&idm),
+		    0, IXL_DMA_LEN(&idm), BUS_DMASYNC_POSTREAD);
+
+		if (rv != 0) {
+			rv = EIO;
+			goto free;
+		}
+		if (iaq.iaq_retval != htole16(IXL_AQ_RC_OK)) {
+			rv = EIO;
+			goto free;
+		}
+
+		memcpy(buf + done, IXL_DMA_KVA(&idm), len);
+		done += chunk;
+	}
+
+free:
+	ixl_dmamem_free(sc, &idm);
+release:
+	(void)ixl_resource_release(sc, IXL_AQ_RESOURCE_NVM, 0);
+	return (rv);
 }
 
 static int
@@ -5209,6 +5649,51 @@ ixl_dmamem_free(struct ixl_softc *sc, struct ixl_dmamem *ixm)
 	bus_dmamem_unmap(sc->sc_dmat, ixm->ixm_kva, ixm->ixm_size);
 	bus_dmamem_free(sc->sc_dmat, &ixm->ixm_seg, 1);
 	bus_dmamap_destroy(sc->sc_dmat, ixm->ixm_map);
+}
+
+/*
+ * Acquire ownership of a shared resource (datasheet 7.10.11.5).
+ * Bytes 16-17 of the command carry the resource ID, 18-19 the access type,
+ * 20-23 the requested timeout (ms), 24-27 the resource number.
+ */
+static int
+ixl_resource_acquire(struct ixl_softc *sc, uint16_t resource, uint16_t type,
+    uint32_t timeout, uint32_t number)
+{
+	struct ixl_aq_desc iaq;
+	int rv;
+
+	memset(&iaq, 0, sizeof(iaq));
+	iaq.iaq_opcode = htole16(IXL_AQ_OP_REQUEST_RESOURCE);
+	iaq.iaq_param[0] = htole32(resource | ((uint32_t)type << 16));
+	iaq.iaq_param[1] = htole32(timeout);
+	iaq.iaq_param[2] = htole32(number);
+
+	rv = ixl_atq_poll(sc, &iaq, 2000);
+	if (rv != 0)
+		return (rv);
+	if (iaq.iaq_retval != htole16(IXL_AQ_RC_OK))
+		return (EIO);
+	return (0);
+}
+
+static int
+ixl_resource_release(struct ixl_softc *sc, uint16_t resource, uint32_t number)
+{
+	struct ixl_aq_desc iaq;
+	int rv;
+
+	memset(&iaq, 0, sizeof(iaq));
+	iaq.iaq_opcode = htole16(IXL_AQ_OP_RELEASE_RESOURCE);
+	iaq.iaq_param[0] = htole32(resource);
+	iaq.iaq_param[2] = htole32(number);
+
+	rv = ixl_atq_poll(sc, &iaq, 2000);
+	if (rv != 0)
+		return (rv);
+	if (iaq.iaq_retval != htole16(IXL_AQ_RC_OK))
+		return (EIO);
+	return (0);
 }
 
 #if NKSTAT > 0

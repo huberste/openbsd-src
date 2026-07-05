@@ -69,6 +69,8 @@
 #define	SIOCSIFMEDIA	_IOWR('i', 55, struct ifreq)	/* set net media */
 #define	SIOCGIFMEDIA	_IOWR('i', 56, struct ifmediareq) /* get net media */
 #define	SIOCGIFSFFPAGE	_IOWR('i', 57, struct if_sffpage) /* get SFF page */
+#define	SIOCGIFNVM	_IOWR('i', 58, struct if_nvmdata) /* get NVM contents */
+#define	SIOCSIFNVMOPEN	_IOWR('i', 59, struct if_nvmsess) /* open NVM session */
 
 #define	SIOCDIFPHYADDR	 _IOW('i', 73, struct ifreq)	/* delete gif addrs */
 #define	SIOCSLIFPHYADDR	 _IOW('i', 74, struct if_laddrreq) /* set gif addrs */
@@ -119,6 +121,10 @@
 #define SIOCBRDGGPARAM  _IOWR('i', 88, struct ifbropreq)/* get brdg STP parms */
 #define SIOCBRDGSTXHC    _IOW('i', 89, struct ifbrparam)/* set tx hold count */
 #define SIOCBRDGSPROTO	 _IOW('i', 90, struct ifbrparam)/* set protocol */
+
+#define	SIOCSIFNVMCLOSE	_IOWR('i', 91, struct if_nvmsess) /* close NVM session */
+#define	SIOCSIFNVMCMD	_IOWR('i', 92, struct if_nvmcmd) /* run NVM AQ command */
+#define	SIOCGIFFWVER	_IOWR('i', 93, struct if_fwver)	/* get firmware version */
 
 #define	SIOCSIFMTU	 _IOW('i', 127, struct ifreq)	/* set ifnet mtu */
 #define	SIOCGIFMTU	_IOWR('i', 126, struct ifreq)	/* get ifnet mtu */
