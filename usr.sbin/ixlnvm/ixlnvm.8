@@ -1,0 +1,675 @@
+.\"	$OpenBSD$
+.\"
+.\" Copyright (c) 2026 Stefan Huber <stefan.huber@stusta.de>
+.\"
+.\" Permission to use, copy, modify, and distribute this software for any
+.\" purpose with or without fee is hereby granted, provided that the above
+.\" copyright notice and this permission notice appear in all copies.
+.\"
+.\" THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+.\" WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+.\" MERCHANTABILITY AND FITNESS.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+.\" ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+.\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+.\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+.\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+.\"
+.Dd $Mdocdate$
+.Dt IXLNVM 8
+.Os
+.Sh NAME
+.Nm ixlnvm
+.Nd manage the NVM of Intel 700-series Ethernet controllers
+.Sh SYNOPSIS
+.Nm ixlnvm
+.Op Cm scan Oo Fl q Oc Oo Fl c Ar nvmupdate.cfg Oc
+.Nm ixlnvm
+.Fl i Ar ifname
+.Cm dump
+.Op Fl o Ar file
+.Nm ixlnvm
+.Fl i Ar ifname
+.Cm show
+.Nm ixlnvm
+.Fl i Ar ifname
+.Cm cfg-read Ar feature_id
+.Nm ixlnvm
+.Fl i Ar ifname
+.Cm selftest
+.Op Fl y
+.Nm ixlnvm
+.Fl i Ar ifname
+.Cm image-diff Ar file
+.Nm ixlnvm
+.Cm image-show Ar file
+.Nm ixlnvm
+.Op Fl i Ar ifname
+.Cm match
+.Fl c Ar nvmupdate.cfg
+.Op Fl e Ar eepid
+.Nm ixlnvm
+.Fl i Ar ifname
+.Cm verify-checksum
+.Nm ixlnvm
+.Fl i Ar ifname
+.Cm image-apply
+.Fl f Ar file
+.Op Fl s
+.Op Fl y
+.Nm ixlnvm
+.Fl i Ar ifname
+.Cm module-update
+.Fl m Ar module
+.Fl f Ar file
+.Op Fl y
+.Sh DESCRIPTION
+.Nm
+reads and updates the non-volatile memory
+.Pq Dq NVM ,
+also referred to as Flash, of an Intel 700-series Ethernet controller
+attached via the
+.Xr ixl 4
+driver.
+It uses the kernel's NVM session ioctls to hold ownership of the
+NVM resource across multiple admin-queue commands.
+.Pp
+The interface to operate on is selected with
+.Fl i Ar ifname .
+.Pp
+The available commands are:
+.Bl -tag -width Ds
+.It Xo
+.Op Cm scan Oo Fl q Oc Oo Fl c Ar nvmupdate.cfg Oc
+.Xc
+List every
+.Xr ixl 4
+interface with its NVM version, running firmware version and
+EETRACK ID, grouping the ports of each physical card by PCI bus and
+device.
+This is the default if no command is given, and it does not take
+.Fl i .
+The
+.Fl q
+and
+.Fl c
+options require the
+.Cm scan
+command to be given explicitly.
+.Pp
+If an
+.Pa nvmupdate.cfg
+manifest is found in the current directory, or one is given with
+.Fl c ,
+each card is matched against it and reported as one of
+.Cm CURRENT ,
+.Cm UPGRADE ,
+.Cm NO_MATCH ,
+.Cm MISSING_BIN
+or
+.Cm ERROR ;
+without a manifest the status is
+.Cm NO_CFG .
+For a card that can be upgraded, the image, the reset type it requires
+.Pq Cm REBOOT No or Cm POWER
+and the exact
+.Cm image-apply
+command line are printed.
+.Pp
+With
+.Fl q ,
+one line per card is printed in a stable, machine-readable format:
+ports, NVM version, firmware version, EETRACK ID, status, image and
+reset type.
+.It Cm dump Op Fl o Ar file
+Read the entire 64 KB NVM as raw bytes.
+With
+.Fl o Ar file ,
+the contents are written to
+.Ar file ;
+otherwise to standard output.
+Writing the binary blob to a terminal is refused; redirect or use
+.Fl o .
+.It Cm show
+Read the NVM header and print a summary of the well-known module
+pointers and the software checksum word.
+.It Cm cfg-read Ar feature_id
+Issue an NVM Config Read admin command (datasheet 3.4.10.4) for the
+given 16-bit
+.Ar feature_id
+and print the 6-byte response.
+For example,
+.Ar feature_id
+0xFFF1 reads the current link-mode selection (1x40G, 2x40G, or 4x10G;
+see datasheet 3.4.5.7).
+This command waits for the asynchronous completion event posted on
+the chip's admin receive queue.
+.It Cm selftest Op Fl y
+Read NVM word 0x16 (the PBA Block pointer, an RW header word per
+datasheet 3.4.5.3) and write the same value back via NVM_UPDATE with
+the Last_Command bit set, exercising the asynchronous bank-swap and
+the kernel's ARQ completion-event demultiplex.
+The card performs a bank swap on Flash, but the NVM contents are
+semantically unchanged (identical-value write keeps the software
+checksum valid).
+Read back and compare to confirm.
+.Pp
+Without
+.Fl y ,
+prints what would happen and exits.
+Pass
+.Fl y
+to confirm and run the test.
+.It Cm image-show Ar file
+Parse an Intel NVM update image
+.Pq Ar file
+and print its NVM control word, software checksum, PBA number,
+and the table of module pointers (with the update flow each module
+needs).
+This subcommand operates on a file and does not require
+.Fl i .
+.It Cm image-diff Ar file
+Verify the chip against an Intel NVM image
+.Pq Ar file ,
+module by module.
+For each NVM module the tool understands, the module is located via
+the
+.Em chip's
+own header pointer
+.Pq not the image's, since a per-module update relocates modules and swaps banks ,
+its bytes are read from the chip, and they are compared to the image's
+copy of that module.
+Each module is reported as one of:
+.Bl -tag -width PRESERVED -compact
+.It Cm MATCH
+chip content equals the image.
+.It Cm DIFFER
+chip content differs; for a module the image carries, this means the
+module is not yet updated on the chip.
+.It Cm MANAGED
+a chip-populated register auto-load or data-recovery module
+.Pq e.g. Cm GLOBR Auto-load , Cm SW-Data-Recovery :
+it differs from the static image by design
+.Pq the firmware fills it with computed/runtime state
+and is excluded from the pass/fail tally.
+.It Cm PRESERVED
+a card-identity field
+.Pq MAC, VPD, PBA, PXE, VLAN, boot config
+that an apply deliberately leaves untouched.
+.It Cm ABSENT No / Cm SKIP
+the module is not present in the image, or its size cannot be
+determined.
+.El
+.Pp
+A correctly updated card reports every authenticated and
+non-authenticated module as
+.Cm MATCH
+and zero
+.Cm DIFFER ;
+the
+.Cm MANAGED
+modules differ identically to how Intel's own tool leaves them.
+This is the recommended way to confirm an
+.Cm image-apply
+took effect.
+.It Xo
+.Cm match
+.Fl c Ar nvmupdate.cfg
+.Op Fl e Ar eepid
+.Xc
+Parse Intel's
+.Ar nvmupdate.cfg
+manifest and identify which packaged
+.Pa .bin
+image is appropriate for a given EETRACK ID.
+Without
+.Fl e ,
+.Fl i Ar ifname
+must be given and the chip's current EETRACK ID is read from words
+0x2d-0x2e of its NVM.
+With
+.Fl e ,
+the EETRACK ID is taken from the command line as a hex string.
+.Pp
+The result names the matching
+.Cm NVM IMAGE
+file, its target EEPID, the required reset type
+.Pq POWER No or Cm REBOOT ,
+and whether the chip is already at the matched image or needs to
+upgrade to it (via the cfg's
+.Cm REPLACES
+list).
+.It Cm verify-checksum
+Read the chip's shadow RAM and verify the software checksum at
+word 0x3f against the value an independent computation derives
+from the same bytes (datasheet 6.1.4.1).
+A match confirms that the chip's NVM state is internally consistent
+and that this tool's checksum algorithm agrees with the firmware's.
+.It Xo
+.Cm image-apply
+.Fl f Ar file
+.Op Fl s
+.Op Fl y
+.Xc
+Apply an Intel NVM image to the chip by running the per-module update
+flow for each module in turn, in three phases:
+.Bl -enum -compact
+.It
+Phase 1: the non-authenticated outside-shadow modules
+.Pq datasheet 3.4.5.4 :
+.Cm EMP Global ,
+.Cm Manageability ,
+.Cm EMP Settings ,
+.Cm PHY Config Scripts ,
+.Cm Configuration Metadata ,
+and
+.Cm External 25G PHY .
+.It
+Phase 2 (only with
+.Fl s ,
+.Sy experimental ) :
+the read/write shadow-RAM modules
+.Pq datasheet 3.4.5.3 .
+This is not part of the supported upgrade: the chip's EMP regenerates
+most of these modules on its own, and direct shadow writes have proven
+fragile and chip-state-dependent.
+See
+.Sx CAVEATS .
+.It
+Phase 2b: the NVM header version words
+.Pq Cm DEV_STARTER_VERSION No word 0x18, Cm EETRACK ID No words 0x2d-0x2e
+and the recomputed software checksum, so the chip reports the new
+image version after the upgrade.
+.It
+Phase 3: the authenticated outside-shadow modules
+.Pq datasheet 3.4.5.5 :
+.Cm PCIe Analog ,
+.Cm PHY Analog ,
+.Cm Option ROM ,
+and
+.Cm EMP Image .
+.El
+.Pp
+.Cm EMP Image
+is applied last: after its
+.Cm LAST_COMMAND
+the chip stops servicing admin-queue commands until power-cycle/reboot,
+so it must be the final step.
+Each authenticated module's RSA-2048 signature is verified by the chip
+on
+.Cm LAST_COMMAND
+and a mismatch causes the chip to reject that module
+.Pq the previous one stays active .
+Modules absent from the image
+.Pq pointer 0xffff/0x0000
+are skipped.
+.Pp
+Without
+.Fl y ,
+.Cm image-apply
+is a dry run: validates the image checksum, EETRACK ID, and per-module
+source offsets, and prints the per-module plan.
+With
+.Fl y ,
+the chip is actually written.
+A reboot is required afterwards.
+.It Xo
+.Cm module-update
+.Fl m Ar module
+.Fl f Ar file
+.Op Fl y
+.Xc
+Update a single NVM module from an Intel NVM image, using the same
+per-module update flow as
+.Cm image-apply .
+The module is selected by name with
+.Fl m .
+.Pp
+Authenticated outside-shadow modules
+.Pq datasheet 3.4.5.5 ,
+whose RSA-2048 signature the chip verifies on
+.Cm LAST_COMMAND
+before switching to them; if verification fails, the update is
+rejected and the old module stays active:
+.Bl -tag -width "globr-autoload" -compact
+.It Cm option-rom
+Option ROM: PXE and UEFI network boot code (1160\~KB).
+.It Cm emp-image
+EMP Image: the firmware of the embedded management processor
+(EMP) that runs the controller (1160\~KB).
+After it is written the chip stops servicing admin-queue commands
+until the system is rebooted; see
+.Sx CAVEATS .
+.It Cm pcie-analog
+PCIe Analog: PCIe SerDes analog settings (8\~KB).
+.It Cm phy-analog
+PHY Analog: Ethernet PHY analog settings (8\~KB).
+.El
+.Pp
+Non-authenticated outside-shadow modules
+.Pq datasheet 3.4.5.4 ,
+written without a signature check:
+.Bl -tag -width "globr-autoload" -compact
+.It Cm emp-global
+EMP Global: global settings of the EMP firmware (8\~KB).
+.It Cm manageability
+Manageability: configuration of the sideband manageability
+interfaces, such as NC-SI (8\~KB).
+.It Cm emp-settings
+EMP Settings: further EMP firmware settings (8\~KB).
+.It Cm phy-scripts
+PHY Config Scripts: link and PHY configuration scripts run by the
+firmware (8\~KB).
+.It Cm config-meta
+Configuration Metadata: the description of the configurable NVM
+options (128\~KB).
+.It Cm ext-25g-phy
+External 25G PHY: firmware for an external 25G PHY, present only on
+cards that have one (128\~KB).
+.El
+.Pp
+An outside-shadow module is written sector by sector with
+interleaved
+.Cm NVM_Erase
+and
+.Cm NVM_Update
+admin-queue commands, the final command carrying
+.Cm LAST_COMMAND .
+.Pp
+Shadow-RAM modules
+.Pq datasheet 3.4.5.3
+live inside the 64 KB shadow RAM and are written with
+.Cm NVM_Update
+followed by a recomputed software checksum.
+Writing them is
+.Sy experimental ;
+see
+.Sx CAVEATS .
+The NVM header word holding each module's pointer is given in
+parentheses:
+.Bl -tag -width "globr-autoload" -compact
+.It Cm auto-gen-ptrs
+Auto Generated Pointers (0x07).
+.It Cm pcir-autoload
+Registers loaded on PCIe reset (0x08).
+.It Cm por-autoload
+Registers loaded on power-on reset (0x38).
+.It Cm globr-autoload
+Registers loaded on global reset (0x3b).
+.It Cm corer-autoload
+Registers loaded on core reset (0x3c).
+.It Cm emp-sr
+EMP shadow-RAM settings (0x48).
+.It Cm feature-cfg
+Feature Configuration (0x49).
+.It Cm core-mem
+Core memory configuration (0x4a).
+.It Cm immediate
+Immediate Fields (0x4e).
+.El
+.Pp
+Card-identity data
+.Pq PBA, boot configuration, SAN MAC, VPD, PXE and VLAN settings
+is never written.
+.Pp
+Without
+.Fl y ,
+prints the plan and exits.
+With
+.Fl y ,
+the chip is actually written.
+A reboot is required afterwards.
+.El
+.Sh SECURITY
+Reading the NVM
+.Pq Cm dump , show , scan , image-diff , verify-checksum , No etc.
+is permitted at any
+.Xr securelevel 7 .
+Writing the NVM
+.Pq Cm image-apply , module-update No with Fl y
+opens a write session, which the kernel allows only at securelevel 0
+or below.
+In the default multi-user securelevel
+.Pq 1 ,
+with the network up, opening a write session fails with
+.Er EPERM .
+This prevents a privileged remote attacker from flashing malicious
+firmware on a running, network-reachable system: to update firmware,
+boot into single-user mode
+.Pq which is administered from the local console and starts no network services ,
+apply the image, and reboot.
+The complete procedure is shown in
+.Sx EXAMPLES .
+.Sh EXIT STATUS
+.Ex -std ixlnvm
+.Sh EXAMPLES
+The following shows a complete NVM update of a system with two
+X710-DA2 cards.
+.Pp
+First, list the cards and their current NVM and firmware versions:
+.Bd -literal -offset indent
+# ixlnvm
+scanning ixl(4) interfaces; nvmupdate.cfg not found, inventory only
+
+ixl0,ixl1  (pci 5:0, 2 ports)
+           nvm 9.30  fw 9.130.73618  eetrack 0x8000e5d7  NO_CFG
+ixl2,ixl3  (pci 7:0, 2 ports)
+           nvm 9.20  fw 9.120.73026  eetrack 0x8000d87f  NO_CFG
+
+summary: 0 upgrade, 0 current, 0 no-match, 0 missing-bin, 0 error
+.Ed
+.Pp
+Download the
+.Dq NVM Update Utility for Intel Ethernet Network Adapter 700 Series
+from Intel.
+This link always leads to the latest version:
+.Pp
+.Lk https://www.intel.com/content/www/us/en/download/18190/
+.Pp
+Intel requires accepting a license in a web browser before the
+download starts, so the package cannot be fetched with
+.Xr ftp 1 .
+The download is a ZIP archive containing one package per operating
+system.
+.Nm
+uses only the
+.Pa nvmupdate.cfg
+manifest and the
+.Pa .bin
+images from the Linux package, not Intel's update tool.
+Extract the Linux package, for example with
+.Ic unzip
+from packages, and unpack it:
+.Bd -literal -offset indent
+# unzip 700Series_NVMUpdatePackage_v9_58.zip \e
+    700Series_NVMUpdatePackage_v9_58_Linux.tar.gz
+# tar -xzf 700Series_NVMUpdatePackage_v9_58_Linux.tar.gz
+.Ed
+.Pp
+Run
+.Nm
+again from the directory containing the manifest
+.Pq or pass it with Fl c
+to see which cards can be upgraded, and the command to do so:
+.Bd -literal -offset indent
+# cd 700Series/Linux_x64
+# ixlnvm
+scanning ixl(4) interfaces against nvmupdate.cfg (120 entries)
+
+ixl0,ixl1  (pci 5:0, 2 ports)
+           nvm 9.30  fw 9.130.73618  eetrack 0x8000e5d7  UPGRADE
+           upgrade to X710DA2_9p58_CFGID7p2_OEMGEN.bin (reset REBOOT)
+           apply:  ixlnvm -i ixl0 image-apply -f X710DA2_9p58_CFGID7p2_OEMGEN.bin -y
+ixl2,ixl3  (pci 7:0, 2 ports)
+           nvm 9.20  fw 9.120.73026  eetrack 0x8000d87f  UPGRADE
+           upgrade to X710DA2_9p58_CFGID7p2_OEMGEN.bin (reset REBOOT)
+           apply:  ixlnvm -i ixl2 image-apply -f X710DA2_9p58_CFGID7p2_OEMGEN.bin -y
+
+summary: 2 upgrade, 0 current, 0 no-match, 0 missing-bin, 0 error
+.Ed
+.Pp
+Writing the NVM requires
+.Xr securelevel 7
+0
+.Pq see Sx SECURITY .
+Reboot and, at the
+.Xr boot 8
+prompt, boot into single-user mode, which runs at securelevel 0:
+.Bd -literal -offset indent
+boot> boot -s
+.Ed
+.Pp
+In single-user mode only the root file system is mounted, read-only.
+Mount the other file systems so that
+.Pa /usr/sbin/ixlnvm
+and the unpacked package are available
+.Pq run Xr fsck 8 No first if Xr mount 8 No refuses ,
+and confirm the securelevel:
+.Bd -literal -offset indent
+# mount -a
+# sysctl kern.securelevel
+kern.securelevel=0
+.Ed
+.Pp
+Change to the package directory again and run the
+.Dq apply:
+line printed for each card.
+Only one port per card needs to be given.
+A complete run looks like this:
+.Bd -literal -offset indent
+# cd 700Series/Linux_x64
+# ixlnvm -i ixl2 image-apply -f X710DA2_9p58_CFGID7p2_OEMGEN.bin -y
+image:      X710DA2_9p58_CFGID7p2_OEMGEN.bin
+  size:       4194304 bytes
+  firmware:   9.58
+  EETRACK ID: 0x800104df
+  checksum:   0xea10 [ok]
+chip:       ixl2
+  EETRACK ID: 0x8000d87f (different)
+
+plan: per-module update across three phases
+
+  Phase 1: FLOW_NONAUTH (datasheet 3.4.5.4)
+    EMP Global            src 0x026000     2 sectors (update 0x09, erase 0x46)
+    Manageability         src 0x028000     2 sectors (update 0x0e, erase 0x46)
+    EMP Settings          src 0x02a000     2 sectors (update 0x0f, erase 0x46)
+    PHY Config Scripts    src 0x024000     2 sectors (update 0x3d, erase 0x46)
+    Configuration Meta    src 0x3b4000    32 sectors (update 0x4d, erase 0x44)
+    External 25G PHY      (not in image, skipped)
+
+  Phase 2: FLOW_SHADOW (datasheet 3.4.5.3, batched) [EXPERIMENTAL]
+    DISABLED (default).  -s enables it, but the EMP
+    regenerates these modules and direct writes are
+    fragile; the supported flow does not use -s.
+
+  Phase 2b: NVM header version words (always on)
+    word 0x18 (DEV_STARTER_VERSION) <- image
+    words 0x2d/0x2e (EETRACK ID)    <- image
+    word 0x3f (software checksum)   <- recomputed [LAST]
+
+  Phase 3: FLOW_AUTH (datasheet 3.4.5.5)
+    PCIe Analog           src 0x020000     2 sectors (update 0x03, erase 0x46)
+    PHY Analog            src 0x022000     2 sectors (update 0x04, erase 0x46)
+    Option ROM            src 0x02e000   290 sectors (update 0x05, erase 0x40)
+    EMP Image             src 0x150000   290 sectors (update 0x0b, erase 0x40)  <- EMP last
+
+  FLOW_AUTH modules: chip verifies RSA-2048 signature on
+    LAST_COMMAND; mismatch keeps the old module active.
+  FLOW_NONAUTH/FLOW_SHADOW: written without signature check.
+  reboot required after completion.
+
+*** writing chip NVM.  DO NOT INTERRUPT.
+  EMP Global: sector    2/2  write [LAST]
+  Manageability: sector    2/2  write [LAST]
+  EMP Settings: sector    2/2  write [LAST]
+  PHY Config Scripts: sector    2/2  write [LAST]
+  Configuration Meta: sector   32/32  write [LAST]
+  reading shadow: 64 / 64 KB
+
+  header: nvm version 0x9058 (word 0x18)
+  header: EETRACK 0x800104df (words 0x2d/0x2e)
+  header: checksum 0xbdce at word 0x3f [LAST]
+  PCIe Analog: sector    2/2  write [LAST]
+  PHY Analog: sector    2/2  write [LAST]
+  Option ROM: sector  290/290  write [LAST]
+  EMP Image: sector  290/290  write [LAST]
+
+Image apply completed.  Reboot the system to load the new firmware.
+# ixlnvm -i ixl0 image-apply -f X710DA2_9p58_CFGID7p2_OEMGEN.bin -y
+\&...
+.Ed
+.Pp
+Do not interrupt the update or remove power while it runs.
+Leaving out
+.Fl y
+prints the plan without writing anything.
+.Pp
+Once all cards are written, reboot
+.Pq or, for a card whose reset type is Cm POWER , power the system off and on again :
+.Bd -literal -offset indent
+# reboot
+.Ed
+.Pp
+After the reboot, running
+.Nm
+in the package directory reports each updated card as
+.Cm CURRENT .
+To compare a card with the image module by module:
+.Bd -literal -offset indent
+# ixlnvm -i ixl2 image-diff X710DA2_9p58_CFGID7p2_OEMGEN.bin
+.Ed
+.Pp
+Dump the NVM of
+.Li ixl0
+to a file:
+.Bd -literal -offset indent
+# ixlnvm -i ixl0 dump -o ixl0.nvm
+.Ed
+.Pp
+Display the NVM header summary:
+.Bd -literal -offset indent
+# ixlnvm -i ixl0 show
+.Ed
+.Sh SEE ALSO
+.Xr ixl 4 ,
+.Xr ifconfig 8
+.Sh HISTORY
+The
+.Nm
+utility first appeared in
+.Ox 8.1 .
+.Sh AUTHORS
+.An Stefan Huber Aq Mt stefan.huber@stusta.de
+.Sh CAVEATS
+Only one process at a time can hold an NVM session on an interface;
+while one is open, a second
+.Nm
+on the same interface fails with
+.Er EBUSY .
+.Pp
+After
+.Cm image-apply
+or
+.Cm module-update Fl m Cm emp-image ,
+the chip stops servicing admin-queue commands and stays in that
+state until power-cycle or reboot.
+This is normal: the running EMP firmware was just replaced and is
+waiting to be reloaded.
+.Pp
+The shadow-RAM update phase
+.Pq Cm image-apply Fl s , No or Cm module-update No of a shadow-RAM module
+is
+.Sy experimental
+and not part of the supported upgrade flow.
+The chip's EMP firmware regenerates most shadow-RAM modules on its own,
+so a normal
+.Cm image-apply
+.Pq without Fl s
+already produces a complete, version-consistent upgrade; this can be
+confirmed with
+.Cm image-diff ,
+which compares each module on the chip against the image.
+Direct shadow-RAM writes have proven fragile and chip-state-dependent
+(intermittent
+.Er EIO )
+and several shadow-RAM modules are read-only or firmware-managed and
+reject writes outright.
