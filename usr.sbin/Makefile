@@ -8,7 +8,7 @@ SUBDIR=	ac accton acme-client acpidump adduser amd apm apmd arp authpf \
 	dvmrpctl dvmrpd \
 	edquota eeprom eigrpd eigrpctl fdformat ftp-proxy fw_update gpioctl \
 	hostapd hostctl hotplugd httpd identd ifstated ikectl inetd \
-	installboot iostat iscsictl iscsid kgmon kvm_mkdb ldapd ldapctl \
+	installboot iostat iscsictl iscsid ixlnvm kgmon kvm_mkdb ldapd ldapctl \
 	ldomctl ldomd ldpd ldpctl lldp lldpd lpr \
 	makefs mailwrapper map-mbone memconfig \
 	mksuncd mkuboot mopd mrinfo mrouted mtrace mtree ndp netgroup_mkdb \
