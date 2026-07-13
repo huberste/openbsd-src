@@ -144,6 +144,8 @@ viasio*	at isa? port 0x4e flags 0x0000
 wbsio*	at isa? port 0x2e		# Winbond LPC Super I/O
 wbsio*	at isa? port 0x4e
 lm*	at wbsio?
+nctgpio* at wbsio?			# Nuvoton NCT6116D GPIO (DFI EHL253 DIO)
+gpio*	at nctgpio?
 uguru0	at isa? disable port 0xe0	# ABIT uGuru
 fins0	at isa? port 0x4e		# Fintek F71805 Super I/O
 

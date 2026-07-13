@@ -247,6 +247,11 @@ device	wbsio {}
 attach	wbsio at isa
 file	dev/isa/wbsio.c			wbsio
 
+# Nuvoton NCT6116D Super I/O GPIO (DFI EHL253 onboard DIO0-7)
+device	nctgpio: gpiobus
+attach	nctgpio at wbsio
+file	dev/isa/nctgpio.c		nctgpio
+
 # SMSC SCH311x Super I/O
 device	schsio {}
 attach	schsio at isa

@@ -145,6 +145,8 @@ schsio*	at isa? port 0x164e
 wbsio*	at isa? port 0x2e	# Winbond LPC Super I/O
 wbsio*	at isa? port 0x4e
 lm*	at wbsio?
+nctgpio* at wbsio?		# Nuvoton NCT6116D GPIO (DFI EHL253 DIO)
+gpio*	at nctgpio?
 uguru0	at isa? disable port 0xe0	# ABIT uGuru
 
 aps0	at isa? port 0x1600		# ThinkPad Active Protection System

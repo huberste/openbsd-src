@@ -28,6 +28,7 @@
 
 #include <dev/isa/isavar.h>
 #include <dev/isa/wbsioreg.h>
+#include <dev/isa/wbsiovar.h>
 
 #ifdef WBSIO_DEBUG
 #define DPRINTF(x) printf x
@@ -55,6 +56,12 @@ const struct cfattach wbsio_ca = {
 struct cfdriver wbsio_cd = {
 	NULL, "wbsio", DV_DULL
 };
+
+/*
+ * Sentinel handed to a GPIO child via isa_attach_args.ia_aux.  See
+ * wbsiovar.h; compared by identity, never dereferenced.
+ */
+const char wbsio_gpio_tag[] = "wbsio-gpio";
 
 static __inline void
 wbsio_conf_enable(bus_space_tag_t iot, bus_space_handle_t ioh)
@@ -112,6 +119,7 @@ wbsio_probe(struct device *parent, void *match, void *aux)
 	case WBSIO_ID_W83697HF:
 	case WBSIO_ID_NCT6775F:
 	case WBSIO_ID_NCT6776F:
+	case WBSIO_ID_NCT6116D:
 	case WBSIO_ID_NCT5104D:
 	case WBSIO_ID_NCT6779D:
 	case WBSIO_ID_NCT6791D:
@@ -180,6 +188,9 @@ wbsio_attach(struct device *parent, struct device *self, void *aux)
 	case WBSIO_ID_NCT6776F:
 		printf(": NCT6776F");
 		break;
+	case WBSIO_ID_NCT6116D:
+		printf(": NCT6116D");
+		break;
 	case WBSIO_ID_NCT6779D:
 		printf(": NCT6779D");
 		break;
@@ -222,14 +233,31 @@ wbsio_attach(struct device *parent, struct device *self, void *aux)
 	/* Escape from configuration mode */
 	wbsio_conf_disable(sc->sc_iot, sc->sc_ioh);
 
-	if (iobase == 0)
-		return;
+	if (iobase != 0) {
+		nia = *ia;
+		nia.ia_iobase = iobase;
+		nia.ia_aux = (void *)(u_long)devid; /* devid for wb_match() */
 
-	nia = *ia;
-	nia.ia_iobase = iobase;
-	nia.ia_aux = (void *)(u_long)devid; /* pass devid down to wb_match() */
+		config_found(self, &nia, wbsio_print);
+	}
 
-	config_found(self, &nia, wbsio_print);
+	/*
+	 * The NCT6116D also exposes GPIO pins, reached through the same
+	 * configuration port we keep mapped.  Offer them to nctgpio(4),
+	 * handing over our live config-space handle: nctgpio shares it
+	 * rather than mapping the port a second time, which the ISA I/O
+	 * extent forbids.
+	 */
+	if (devid == WBSIO_ID_NCT6116D) {
+		nia = *ia;
+		nia.ia_iot = sc->sc_iot;
+		nia.ia_ioh = sc->sc_ioh;
+		nia.ia_iobase = ia->ia_iobase;
+		nia.ia_iosize = WBSIO_IOSIZE;
+		nia.ia_aux = (void *)wbsio_gpio_tag;
+
+		config_found(self, &nia, wbsio_print);
+	}
 }
 
 int
