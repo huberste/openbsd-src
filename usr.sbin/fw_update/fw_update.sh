@@ -323,6 +323,58 @@ firmware_devicename() {
 	echo "$_d"
 }
 
+# EETRACK IDs of the NVM images on the ixl(4) cards in the system.
+ixl_eetracks() {
+	local _dmesg
+
+	for _dmesg in ${DMESG:-/var/run/dmesg.boot "$WRKTMP/dmesg"}; do
+		[ "$_dmesg" = "$WRKTMP/dmesg" ] && dmesg >| "$_dmesg"
+		[ -s "$_dmesg" ] || continue
+		sed -n 'H;/^OpenBSD/h;${g;p;}' "$_dmesg" |
+		    sed -n 's/^ixl[0-9]* at .* eetrack \([0-9a-f]*\),.*/\1/p'
+	done
+}
+
+# The ixl(4) firmware contains NVM images for all Intel 700 series cards.
+# Only install Intel's manifest and the images that the manifest lists as
+# an update for one of the cards in the system.
+ixl_firmware() {
+	local _pkg=$1 _dir="$WRKTMP/ixl" _l _e _img _match _skip
+	local _cfg=firmware/intel-ixl/nvmupdate.cfg _files _eetracks
+	typeset -u _eetracks
+
+	set -- $( ixl_eetracks )
+	_eetracks=" $* "
+	_files="firmware/intel-ixl-license $_cfg "
+
+	mkdir -p "$_dir"
+	tar -C "$_dir" -zxf "$_pkg" "$_cfg"
+
+	while IFS= read -r _l; do
+		_l=${_l%%+([[:space:]])}
+		case $_l in
+		"BEGIN DEVICE")
+			_img='' _match=false _skip=false ;;
+		"NVM IMAGE:"*)
+			_img=${_l#NVM IMAGE:}
+			_img=${_img##+([[:space:]])} ;;
+		"REPLACES:"*)
+			for _e in ${_l#REPLACES:}; do
+				[[ $_eetracks == *" $_e "* ]] && _match=true
+			done ;;
+		"PHY IMAGE:"*|"PBA:"*)
+			_skip=true ;;
+		"END DEVICE")
+			"$_match" && ! "$_skip" || continue
+			[[ $_img == +([[:alnum:]_.-]) ]] || continue
+			[[ $_files == *" firmware/intel-ixl/$_img "* ]] ||
+			    _files="${_files}firmware/intel-ixl/$_img " ;;
+		esac
+	done < "$_dir/$_cfg"
+
+	echo "$_files"
+}
+
 lock_db() {
 	local _waited
 	[ "${LOCKPID:-}" ] && return 0
@@ -415,7 +467,7 @@ detect_firmware() {
 
 add_firmware () {
 	local _f="${1##*/}" _m="${2:-Install}"
-	local _pkgdir="${DESTDIR}/var/db/pkg" _pkg
+	local _pkgdir="${DESTDIR}/var/db/pkg" _pkg _files="firmware/*"
 	FWPKGTMP="$( tmpdir "${DESTDIR}/var/db/pkg/.firmware" )"
 	local _flags=-vm
 	case "$VERBOSE" in
@@ -423,11 +475,14 @@ add_firmware () {
 		2|3) _flags=-Vm ;;
 	esac
 
+	[ "$( firmware_devicename "$_f" )" = ixl ] &&
+	    _files="$( ixl_firmware "$1" )"
+
 	ftp -N "${0##/}" -D "$_m" "$_flags" -o- "file:${1}" |
 		tar -s ",^\+,${FWPKGTMP}/+," \
 		    -s ",^firmware,${DESTDIR}/etc/firmware," \
 		    -s ",.*,," \
-		    -C / -zxphf - "+*" "firmware/*"
+		    -C / -zxphf - "+*" $_files
 
 
 	[ -s "${FWPKGTMP}/+CONTENTS" ] &&

@@ -113,6 +113,7 @@ main(void)
 	printf("%s\n", "iwm");
 	printf("%s\n", "iwn");
 	printf("%s\n", "iwx");
+	printf("%s\n", "ixl");
 	printf("%s\n", "malo");
 	printf("%s\n", "mtw");
 	printf("%s\n", "mwx");
