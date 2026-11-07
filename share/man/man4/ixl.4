@@ -33,6 +33,18 @@ To ensure correct driver operation, apply the most recent
 .Pq stable
 firmware update for the network controller.
 .Pp
+When Intel's NVM update images have been installed with
+.Xr fw_update 8 ,
+the driver updates the NVM of a controller while the system boots if
+a newer image is listed for it.
+This takes a few minutes and must not be interrupted.
+All ports of an updated controller stay disabled until the system is
+rebooted, or powered off and on again if the image requires it.
+Controllers that are already in use, for example for an NFS root file
+system, are not updated.
+.Xr ixlnvm 8
+can be used to inspect the NVM or to install a different image.
+.Pp
 The
 .Nm ixl
 driver supports querying pluggable transceivers for information and
@@ -40,6 +52,25 @@ diagnostics.
 .\" via ifconfig ixlX sff .
 This functionality is available on controllers providing API version
 1.6 and higher.
+.Sh FILES
+The driver updates the NVM of a controller from the following files,
+which are read when the system boots:
+.Pp
+.Bl -tag -width Ds -offset indent -compact
+.It Pa /etc/firmware/intel-ixl/nvmupdate.cfg
+.It Pa /etc/firmware/intel-ixl/*.bin
+.El
+.Pp
+These firmware files are not free because Intel refuses to grant
+distribution rights without contractual obligations.
+As a result, even though
+.Ox
+includes the driver, the firmware files cannot be included and
+users have to download the files on their own.
+.Pp
+A prepackaged version of the firmware can be installed using
+.Xr fw_update 8 ,
+which installs only the images needed by the controllers in the system.
 .Sh SEE ALSO
 .Xr arp 4 ,
 .Xr ifmedia 4 ,
@@ -47,7 +78,9 @@ This functionality is available on controllers providing API version
 .Xr netintro 4 ,
 .Xr pci 4 ,
 .Xr hostname.if 5 ,
-.Xr ifconfig 8
+.Xr fw_update 8 ,
+.Xr ifconfig 8 ,
+.Xr ixlnvm 8
 .Sh HISTORY
 The
 .Nm
