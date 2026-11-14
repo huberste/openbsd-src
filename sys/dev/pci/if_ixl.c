@@ -193,6 +193,9 @@ struct ixl_aq_desc {
 #define IXL_AQ_OP_PHY_SET_EVENT_MASK	0x0613
 #define IXL_AQ_OP_PHY_SET_REGISTER	0x0628
 #define IXL_AQ_OP_PHY_GET_REGISTER	0x0629
+#define IXL_AQ_OP_NVM_READ		0x0701
+#define IXL_AQ_OP_NVM_ERASE		0x0702
+#define IXL_AQ_OP_NVM_UPDATE		0x0703
 #define IXL_AQ_OP_LLDP_GET_MIB		0x0a00
 #define IXL_AQ_OP_LLDP_MIB_CHG_EV	0x0a01
 #define IXL_AQ_OP_LLDP_ADD_TLV		0x0a02
@@ -206,6 +209,22 @@ struct ixl_aq_desc {
 #define IXL_AQ_OP_SET_RSS_LUT		0x0b03 /* 722 only */
 #define IXL_AQ_OP_GET_RSS_KEY		0x0b04 /* 722 only */
 #define IXL_AQ_OP_GET_RSS_LUT		0x0b05 /* 722 only */
+/* Shared resource IDs (datasheet table 7-213) */
+#define IXL_AQ_RESOURCE_NVM			0x0001
+/* Shared resource access types */
+#define IXL_AQ_RESOURCE_READ			0x0001
+#define IXL_AQ_RESOURCE_WRITE			0x0002
+/* Default timeouts in ms (datasheet table 7-213) */
+#define IXL_AQ_RESOURCE_NVM_READ_TIMEOUT	  3000
+#define IXL_AQ_RESOURCE_NVM_WRITE_TIMEOUT	180000
+
+/* NVM_READ command flags (byte 16 of NVM read AQ command) */
+#define IXL_AQ_NVM_LAST_COMMAND			(1 << 0)
+
+/* NVM header words (datasheet table 6-2) */
+#define IXL_NVM_W_DEV_STARTER			0x18
+#define IXL_NVM_W_EETRACK_LO			0x2d
+#define IXL_NVM_W_EETRACK_HI			0x2e
 
 struct ixl_aq_mac_addresses {
 	uint8_t		pf_lan[ETHER_ADDR_LEN];
@@ -1221,6 +1240,11 @@ struct ixl_softc {
 
 	uint16_t		 sc_api_major;
 	uint16_t		 sc_api_minor;
+	int			 sc_pci_bus;
+	int			 sc_pci_dev;
+	pci_product_id_t	 sc_pci_product;
+	uint16_t		 sc_nvm_version;
+	uint32_t		 sc_nvm_eetrack;
 	uint8_t			 sc_pf_id;
 	uint16_t		 sc_uplink_seid;	/* le */
 	uint16_t		 sc_downlink_seid;	/* le */
@@ -1266,6 +1290,14 @@ struct ixl_softc {
 	struct rwlock		 sc_cfg_lock;
 	unsigned int		 sc_dead;
 
+	int			 sc_nvm_checked;
+
+	/* completion event of the NVM command in flight */
+	struct mutex		 sc_nvm_arq_mtx;
+	int			 sc_nvm_arq_wait;
+	int			 sc_nvm_arq_valid;
+	struct ixl_aq_desc	 sc_nvm_arq_event;
+
 	uint8_t			 sc_enaddr[ETHER_ADDR_LEN];
 
 #if NKSTAT > 0
@@ -1285,6 +1317,10 @@ static int	ixl_pf_reset(struct ixl_softc *);
 static int	ixl_dmamem_alloc(struct ixl_softc *, struct ixl_dmamem *,
 		    bus_size_t, u_int);
 static void	ixl_dmamem_free(struct ixl_softc *, struct ixl_dmamem *);
+
+static int	ixl_resource_acquire(struct ixl_softc *, uint16_t, uint16_t,
+		    uint32_t, uint32_t);
+static int	ixl_resource_release(struct ixl_softc *, uint16_t, uint32_t);
 
 static int	ixl_arq_fill(struct ixl_softc *);
 static void	ixl_arq_unfill(struct ixl_softc *);
@@ -1366,6 +1402,14 @@ static void	ixl_rxfill(struct ixl_softc *, struct ixl_rx_ring *);
 static void	ixl_rxrefill(void *);
 static int	ixl_rxrinfo(struct ixl_softc *, struct if_rxrinfo *);
 static void	ixl_rx_checksum(struct mbuf *, uint64_t);
+static int	ixl_nvm_aq(struct ixl_softc *, struct ixl_aq_desc *,
+		    struct ixl_dmamem *, int, unsigned int);
+static int	ixl_nvm_read_locked(struct ixl_softc *, uint16_t, uint16_t,
+		    uint16_t *);
+static int	ixl_nvm_read(struct ixl_softc *, uint16_t, uint16_t, uint16_t *);
+#ifndef SMALL_KERNEL
+static void	ixl_attachhook(struct device *);
+#endif
 
 #if NKSTAT > 0
 static void	ixl_kstat_attach(struct ixl_softc *);
@@ -1651,6 +1695,9 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
 	sc->sc_dmat = pa->pa_dmat;
+	pci_decompose_tag(pa->pa_pc, pa->pa_tag,
+	    &sc->sc_pci_bus, &sc->sc_pci_dev, NULL);
+	sc->sc_pci_product = PCI_PRODUCT(pa->pa_id);
 	sc->sc_aq_regs = &ixl_pf_aq_regs;
 
 	sc->sc_nqueues = 0; /* 1 << 0 is 1 queue */
@@ -1692,6 +1739,7 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	/* initialise the adminq */
 
 	mtx_init(&sc->sc_atq_mtx, IPL_NET);
+	mtx_init(&sc->sc_nvm_arq_mtx, IPL_NET);
 
 	if (ixl_dmamem_alloc(sc, &sc->sc_atq,
 	    sizeof(struct ixl_aq_desc) * IXL_AQ_NUM, IXL_AQ_ALIGN) != 0) {
@@ -1765,6 +1813,22 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 	ixl_wr(sc, sc->sc_aq_regs->arq_tail, sc->sc_arq_prod);
+
+	{
+		uint16_t w[IXL_NVM_W_EETRACK_HI - IXL_NVM_W_DEV_STARTER + 1];
+
+		if (ixl_nvm_read(sc, IXL_NVM_W_DEV_STARTER, nitems(w),
+		    w) == 0) {
+			sc->sc_nvm_version = lemtoh16(&w[0]);
+			sc->sc_nvm_eetrack = lemtoh16(&w[IXL_NVM_W_EETRACK_LO -
+			    IXL_NVM_W_DEV_STARTER]) |
+			    (uint32_t)lemtoh16(&w[IXL_NVM_W_EETRACK_HI -
+			    IXL_NVM_W_DEV_STARTER]) << 16;
+			printf(", NVM %x.%02x eetrack %08x",
+			    sc->sc_nvm_version >> 12,
+			    sc->sc_nvm_version & 0xff, sc->sc_nvm_eetrack);
+		}
+	}
 
 	if (ixl_pxe_clear(sc) != 0) {
 		/* error printed by ixl_pxe_clear */
@@ -1975,6 +2039,10 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	ixl_kstat_attach(sc);
 #endif
 
+#ifndef SMALL_KERNEL
+	config_mountroot(self, ixl_attachhook);
+#endif
+
 	return;
 free_vectors:
 	if (sc->sc_intrmap != NULL) {
@@ -2101,7 +2169,8 @@ ixl_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		break;
 
 	case SIOCADDMULTI:
-		if (ether_addmulti(ifr, &sc->sc_ac) == ENETRESET) {
+		if (ether_addmulti(ifr, &sc->sc_ac) == ENETRESET &&
+		    !sc->sc_dead) {
 			error = ether_multiaddr(&ifr->ifr_addr, addrlo, addrhi);
 			if (error != 0)
 				return (error);
@@ -2121,7 +2190,8 @@ ixl_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		break;
 
 	case SIOCDELMULTI:
-		if (ether_delmulti(ifr, &sc->sc_ac) == ENETRESET) {
+		if (ether_delmulti(ifr, &sc->sc_ac) == ENETRESET &&
+		    !sc->sc_dead) {
 			error = ether_multiaddr(&ifr->ifr_addr, addrlo, addrhi);
 			if (error != 0)
 				return (error);
@@ -2138,6 +2208,10 @@ ixl_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		break;
 
 	case SIOCGIFSFFPAGE:
+		if (sc->sc_dead) {
+			error = ENXIO;
+			break;
+		}
 		error = rw_enter(&ixl_sff_lock, RW_WRITE|RW_INTR);
 		if (error != 0)
 			break;
@@ -3605,6 +3679,22 @@ ixl_arq(void *xsc)
 		case HTOLE16(IXL_AQ_OP_PHY_LINK_STATUS):
 			ixl_link_state_update_iaq(sc, iaq);
 			break;
+		case HTOLE16(IXL_AQ_OP_NVM_READ):
+		case HTOLE16(IXL_AQ_OP_NVM_ERASE):
+		case HTOLE16(IXL_AQ_OP_NVM_UPDATE):
+			/*
+			 * The chip does not echo the cookie on NVM
+			 * completion events, so hand the event to the one
+			 * command in flight.
+			 */
+			mtx_enter(&sc->sc_nvm_arq_mtx);
+			if (sc->sc_nvm_arq_wait) {
+				sc->sc_nvm_arq_event = *iaq;
+				sc->sc_nvm_arq_valid = 1;
+				wakeup(&sc->sc_nvm_arq_valid);
+			}
+			mtx_leave(&sc->sc_nvm_arq_mtx);
+			break;
 		}
 
 		memset(iaq, 0, sizeof(*iaq));
@@ -3812,6 +3902,163 @@ ixl_get_version(struct ixl_softc *sc)
 	    sc->sc_api_major, sc->sc_api_minor);
 
 	return (0);
+}
+
+/*
+ * Issue an NVM admin queue command.  The caller fills in the opcode,
+ * data length and parameters; idm, if not NULL, is the data buffer and
+ * write gives its direction.  If wait_ms is not zero, wait that long
+ * for the completion event the chip posts on the receive queue.
+ *
+ * The return value only says whether the command could be issued.  The
+ * chip's status is left in iaq->iaq_retval and must be checked by the
+ * caller.
+ */
+static int
+ixl_nvm_aq(struct ixl_softc *sc, struct ixl_aq_desc *iaq,
+    struct ixl_dmamem *idm, int write, unsigned int wait_ms)
+{
+	uint16_t opcode = lemtoh16(&iaq->iaq_opcode);
+	uint16_t flags = 0;
+	int error;
+
+	if (idm != NULL) {
+		flags = IXL_AQ_BUF;
+		if (lemtoh16(&iaq->iaq_datalen) > I40E_AQ_LARGE_BUF)
+			flags |= IXL_AQ_LB;
+		if (write)
+			flags |= IXL_AQ_RD;
+		ixl_aq_dva(iaq, IXL_DMA_DVA(idm));
+	}
+
+	/*
+	 * Datasheet 3.4.5.4 - 3.4.5.6: in a multi-step NVM_UPDATE or
+	 * NVM_ERASE sequence the FE (Flush on Error) bit must be set on
+	 * every command except the last one, so the chip discards the
+	 * remaining queued commands if any single command fails.
+	 */
+	if ((opcode == IXL_AQ_OP_NVM_UPDATE ||
+	    opcode == IXL_AQ_OP_NVM_ERASE) &&
+	    !(lemtoh32(&iaq->iaq_param[0]) & IXL_AQ_NVM_LAST_COMMAND))
+		flags |= IXL_AQ_FE;
+	htolem16(&iaq->iaq_flags, flags);
+
+	if (wait_ms != 0) {
+		mtx_enter(&sc->sc_nvm_arq_mtx);
+		sc->sc_nvm_arq_wait = 1;
+		sc->sc_nvm_arq_valid = 0;
+		mtx_leave(&sc->sc_nvm_arq_mtx);
+	}
+
+	if (idm != NULL) {
+		bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(idm), 0,
+		    IXL_DMA_LEN(idm),
+		    write ? BUS_DMASYNC_PREWRITE : BUS_DMASYNC_PREREAD);
+	}
+	error = ixl_atq_poll(sc, iaq, 2000);
+	if (idm != NULL) {
+		bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(idm), 0,
+		    IXL_DMA_LEN(idm),
+		    write ? BUS_DMASYNC_POSTWRITE : BUS_DMASYNC_POSTREAD);
+	}
+	if (wait_ms == 0)
+		return (error);
+
+	mtx_enter(&sc->sc_nvm_arq_mtx);
+	if (error == 0 && iaq->iaq_retval == htole16(IXL_AQ_RC_OK)) {
+		while (!sc->sc_nvm_arq_valid) {
+			error = msleep_nsec(&sc->sc_nvm_arq_valid,
+			    &sc->sc_nvm_arq_mtx, PRIBIO | PCATCH, "ixlnvm",
+			    MSEC_TO_NSEC(wait_ms));
+			if (error != 0)
+				break;
+		}
+		if (error == 0) {
+			iaq->iaq_retval = sc->sc_nvm_arq_event.iaq_retval;
+			iaq->iaq_param[0] = sc->sc_nvm_arq_event.iaq_param[0];
+		}
+	}
+	sc->sc_nvm_arq_wait = 0;
+	sc->sc_nvm_arq_valid = 0;
+	mtx_leave(&sc->sc_nvm_arq_mtx);
+
+	return (error);
+}
+
+/*
+ * Read words from the NVM (Flash) of an Intel 700-series controller into
+ * a kernel buffer.  Issues NVM Read admin commands (opcode 0x0701) in
+ * chunks of up to 4 KB, as required by the datasheet (see Intel Ethernet
+ * Controller X710/XXV710/XL710 datasheet, sections 3.4.10.1 and 7.10.2).
+ * The words are returned as stored in the NVM, i.e. little endian.
+ *
+ * Caller must own the NVM resource.
+ */
+static int
+ixl_nvm_read_locked(struct ixl_softc *sc, uint16_t woffset, uint16_t nwords,
+    uint16_t *buf)
+{
+	struct ixl_aq_desc iaq;
+	struct ixl_dmamem idm;
+	const uint16_t bufsz = MIN(IXL_AQ_BUFLEN, nwords * sizeof(uint16_t));
+	uint32_t done = 0;
+	int rv = 0;
+
+	if (ixl_dmamem_alloc(sc, &idm, bufsz, 0) != 0)
+		return (ENOMEM);
+
+	while (done < nwords) {
+		const uint16_t chunk = MIN(nwords - done,
+		    bufsz / sizeof(uint16_t));
+		const uint16_t len = chunk * sizeof(uint16_t);
+		uint32_t byteoff = ((uint32_t)woffset + done) * sizeof(uint16_t);
+		uint8_t cmdflags = 0;
+
+		if (done + chunk >= nwords)
+			cmdflags |= IXL_AQ_NVM_LAST_COMMAND;
+
+		memset(&iaq, 0, sizeof(iaq));
+		iaq.iaq_opcode = htole16(IXL_AQ_OP_NVM_READ);
+		iaq.iaq_datalen = htole16(len);
+		/*
+		 * Command bytes 16-19 (param[0], LE):
+		 *   byte 16    = Command Flags
+		 *   byte 17    = Module Pointer (0 = flat Flash)
+		 *   bytes 18-19 = Length in bytes
+		 */
+		iaq.iaq_param[0] = htole32(cmdflags | ((uint32_t)len << 16));
+		/* Bytes 20-23: byte offset (only 22:20 used, 23 reserved). */
+		iaq.iaq_param[1] = htole32(byteoff);
+
+		if (ixl_nvm_aq(sc, &iaq, &idm, 0, 0) != 0 ||
+		    iaq.iaq_retval != htole16(IXL_AQ_RC_OK)) {
+			rv = EIO;
+			break;
+		}
+
+		memcpy(buf + done, IXL_DMA_KVA(&idm), len);
+		done += chunk;
+	}
+
+	ixl_dmamem_free(sc, &idm);
+	return (rv);
+}
+
+static int
+ixl_nvm_read(struct ixl_softc *sc, uint16_t woffset, uint16_t nwords,
+    uint16_t *buf)
+{
+	int rv;
+
+	rv = ixl_resource_acquire(sc, IXL_AQ_RESOURCE_NVM,
+	    IXL_AQ_RESOURCE_READ, IXL_AQ_RESOURCE_NVM_READ_TIMEOUT, 0);
+	if (rv != 0)
+		return (rv);
+
+	rv = ixl_nvm_read_locked(sc, woffset, nwords, buf);
+
+	(void)ixl_resource_release(sc, IXL_AQ_RESOURCE_NVM, 0);
+	return (rv);
 }
 
 static int
@@ -5211,6 +5458,597 @@ ixl_dmamem_free(struct ixl_softc *sc, struct ixl_dmamem *ixm)
 	bus_dmamem_free(sc->sc_dmat, &ixm->ixm_seg, 1);
 	bus_dmamap_destroy(sc->sc_dmat, ixm->ixm_map);
 }
+
+/*
+ * Acquire ownership of a shared resource (datasheet 7.10.11.5).
+ * Bytes 16-17 of the command carry the resource ID, 18-19 the access type,
+ * 20-23 the requested timeout (ms), 24-27 the resource number.
+ */
+static int
+ixl_resource_acquire(struct ixl_softc *sc, uint16_t resource, uint16_t type,
+    uint32_t timeout, uint32_t number)
+{
+	struct ixl_aq_desc iaq;
+	int rv;
+
+	memset(&iaq, 0, sizeof(iaq));
+	iaq.iaq_opcode = htole16(IXL_AQ_OP_REQUEST_RESOURCE);
+	iaq.iaq_param[0] = htole32(resource | ((uint32_t)type << 16));
+	iaq.iaq_param[1] = htole32(timeout);
+	iaq.iaq_param[2] = htole32(number);
+
+	rv = ixl_atq_poll(sc, &iaq, 2000);
+	if (rv != 0)
+		return (rv);
+	if (iaq.iaq_retval != htole16(IXL_AQ_RC_OK))
+		return (EIO);
+	return (0);
+}
+
+static int
+ixl_resource_release(struct ixl_softc *sc, uint16_t resource, uint32_t number)
+{
+	struct ixl_aq_desc iaq;
+	int rv;
+
+	memset(&iaq, 0, sizeof(iaq));
+	iaq.iaq_opcode = htole16(IXL_AQ_OP_RELEASE_RESOURCE);
+	iaq.iaq_param[0] = htole32(resource);
+	iaq.iaq_param[2] = htole32(number);
+
+	rv = ixl_atq_poll(sc, &iaq, 2000);
+	if (rv != 0)
+		return (rv);
+	if (iaq.iaq_retval != htole16(IXL_AQ_RC_OK))
+		return (EIO);
+	return (0);
+}
+
+#ifndef SMALL_KERNEL
+/*
+ * NVM update from /etc/firmware.
+ *
+ * fw_update(8) installs Intel's complete Flash images for a PCI device ID
+ * in /etc/firmware/ixl-<device>/, together with an index.  Each line of
+ * the index names an image: its EETRACK ID, whether the card needs a
+ * power cycle instead of a reboot afterwards, the file and the EETRACK IDs
+ * of the NVMs it replaces, for example
+ *
+ *	800104df reboot X710DA2_9p58_CFGID7p2_OEMGEN.bin 8000e5d7 80008ae8
+ *
+ * Once root is mounted, the first port of each card looks up the EETRACK
+ * ID of its NVM and, if an image replaces it, writes the image's modules
+ * using the update flows of datasheet 3.4.5.  Card specific data in the
+ * shadow RAM (MAC addresses, VPD, PBA, ...) is not touched.
+ *
+ * Once the EMP Image module is written, the firmware stops servicing
+ * the admin queue until the next reset, so all ports of the card stay
+ * disabled until the system is rebooted.
+ */
+
+#define IXL_NVM_DIR		"ixl-%04x"
+#define IXL_NVM_SR_WORDS	(64 * 1024 / 2)
+#define IXL_NVM_SECTOR		4096
+#define IXL_NVM_W_EMP_IMAGE	0x0b
+#define IXL_NVM_W_VPD		0x2f
+#define IXL_NVM_W_PCIE_ALT	0x3e
+#define IXL_NVM_W_CHECKSUM	0x3f
+#define IXL_NVM_CHECKSUM_BASE	0xbaba
+#define IXL_NVM_CHECKSUM_SKIP	512	/* words of VPD and PCIe ALT */
+
+struct ixl_nvm_module {
+	uint8_t		nm_ptr;		/* header word, module to update */
+	uint8_t		nm_erase;	/* free provisioning area */
+	uint16_t	nm_sectors;	/* size of the module area */
+};
+
+/*
+ * Modules in the order they are written.  The NVM header version words
+ * are written right before EMP Image, which must be last.
+ */
+static const struct ixl_nvm_module ixl_nvm_modules[] = {
+	/* not authenticated, datasheet 3.4.5.4 */
+	{ 0x09, 0x46, 2 },			/* EMP Global */
+	{ 0x0e, 0x46, 2 },			/* Manageability */
+	{ 0x0f, 0x46, 2 },			/* EMP Settings */
+	{ 0x3d, 0x46, 2 },			/* PHY Config Scripts */
+	{ 0x4d, 0x44, 32 },			/* Configuration Metadata */
+	{ 0x4f, 0x44, 32 },			/* External 25G PHY */
+	/* authenticated, datasheet 3.4.5.5 */
+	{ 0x03, 0x46, 2 },			/* PCIe Analog */
+	{ 0x04, 0x46, 2 },			/* PHY Analog */
+	{ 0x05, 0x40, 290 },			/* Option ROM */
+	{ IXL_NVM_W_EMP_IMAGE, 0x40, 290 },	/* EMP Image */
+};
+
+struct ixl_nvm_update {
+	char			 nu_image[64];
+	uint32_t		 nu_eepid;
+	int			 nu_power;	/* needs a power cycle */
+	u_char			*nu_img;
+	size_t			 nu_imglen;
+	struct ixl_dmamem	 nu_idm;
+	unsigned int		 nu_done;
+	unsigned int		 nu_total;
+	unsigned int		 nu_pct;
+};
+
+/* Controllers fw_update(8) has NVM images for, see its patterns.c */
+static const pci_product_id_t ixl_nvm_devices[] = {
+	PCI_PRODUCT_INTEL_X710_10G_SFP,
+	PCI_PRODUCT_INTEL_XL710_40G_BP,
+	PCI_PRODUCT_INTEL_X710_10G_BP,
+	PCI_PRODUCT_INTEL_XL710_QSFP_1,
+	PCI_PRODUCT_INTEL_XL710_QSFP_2,
+	PCI_PRODUCT_INTEL_XXV710_25G_BP,
+	PCI_PRODUCT_INTEL_XXV710_25G_SFP28,
+	PCI_PRODUCT_INTEL_X710_10G_T,
+	PCI_PRODUCT_INTEL_X722_10G_SFP_1,
+};
+
+#define IXL_SAME_CARD(_a, _b)	((_a)->sc_pci_bus == (_b)->sc_pci_bus && \
+				 (_a)->sc_pci_dev == (_b)->sc_pci_dev)
+
+static inline uint16_t
+ixl_nvm_word(const uint8_t *nvm, unsigned int w)
+{
+	return (nvm[w * 2] | (nvm[w * 2 + 1] << 8));
+}
+
+/*
+ * Software checksum over the shadow RAM, datasheet 6.1.4.1.  The VPD
+ * and PCIe ALT Auto-load modules and the checksum word are skipped.
+ */
+static uint16_t
+ixl_nvm_checksum(const uint8_t *sr)
+{
+	uint16_t vpd = ixl_nvm_word(sr, IXL_NVM_W_VPD);
+	uint16_t alt = ixl_nvm_word(sr, IXL_NVM_W_PCIE_ALT);
+	uint16_t sum = 0;
+	unsigned int w;
+
+	for (w = 0; w < IXL_NVM_SR_WORDS; w++) {
+		if (w == IXL_NVM_W_CHECKSUM)
+			continue;
+		if (vpd != 0xffff && (vpd & 0x8000) == 0 &&
+		    w >= vpd && w < vpd + IXL_NVM_CHECKSUM_SKIP)
+			continue;
+		if (alt != 0xffff && (alt & 0x8000) == 0 &&
+		    w >= alt && w < alt + IXL_NVM_CHECKSUM_SKIP)
+			continue;
+		sum += ixl_nvm_word(sr, w);
+	}
+
+	return (IXL_NVM_CHECKSUM_BASE - sum);
+}
+
+/* Return the next word of an index line, NULL at the end of the line. */
+static const char *
+ixl_nvm_index_word(const char **pp, const char *eol, size_t *len)
+{
+	const char *p = *pp, *w;
+
+	while (p < eol && (*p == ' ' || *p == '\t' || *p == '\r'))
+		p++;
+	w = p;
+	while (p < eol && *p != ' ' && *p != '\t' && *p != '\r')
+		p++;
+	*pp = p;
+	*len = p - w;
+
+	return (*len > 0 ? w : NULL);
+}
+
+static int
+ixl_nvm_index_hex(const char *w, size_t len, uint32_t *v)
+{
+	size_t i;
+
+	if (len == 0 || len > 8)
+		return (EINVAL);
+
+	*v = 0;
+	for (i = 0; i < len; i++) {
+		if (w[i] >= '0' && w[i] <= '9')
+			*v = *v << 4 | (w[i] - '0');
+		else if (w[i] >= 'a' && w[i] <= 'f')
+			*v = *v << 4 | (w[i] - 'a' + 10);
+		else
+			return (EINVAL);
+	}
+
+	return (0);
+}
+
+/* Find the image that replaces the NVM of the card in the index. */
+static int
+ixl_nvm_index_lookup(struct ixl_softc *sc, const char *idx, size_t len,
+    struct ixl_nvm_update *nu)
+{
+	const char *p, *eol, *end = idx + len, *w;
+	size_t wlen, i;
+	uint32_t eepid, x;
+	int power;
+
+	for (p = idx; p < end; p = eol + 1) {
+		eol = memchr(p, '\n', end - p);
+		if (eol == NULL)
+			eol = end;
+
+		w = ixl_nvm_index_word(&p, eol, &wlen);
+		if (w == NULL || ixl_nvm_index_hex(w, wlen, &eepid) != 0 ||
+		    eepid == sc->sc_nvm_eetrack)
+			continue;
+
+		w = ixl_nvm_index_word(&p, eol, &wlen);
+		if (w != NULL && wlen == 6 && memcmp(w, "reboot", 6) == 0)
+			power = 0;
+		else if (w != NULL && wlen == 5 && memcmp(w, "power", 5) == 0)
+			power = 1;
+		else
+			continue;
+
+		w = ixl_nvm_index_word(&p, eol, &wlen);
+		if (w == NULL || wlen >= sizeof(nu->nu_image) || w[0] == '.')
+			continue;
+		for (i = 0; i < wlen; i++) {
+			if (!(w[i] >= 'a' && w[i] <= 'z') &&
+			    !(w[i] >= 'A' && w[i] <= 'Z') &&
+			    !(w[i] >= '0' && w[i] <= '9') &&
+			    w[i] != '_' && w[i] != '-' && w[i] != '.')
+				break;
+		}
+		if (i < wlen)
+			continue;
+		memcpy(nu->nu_image, w, wlen);
+		nu->nu_image[wlen] = '\0';
+
+		while ((w = ixl_nvm_index_word(&p, eol, &wlen)) != NULL) {
+			if (ixl_nvm_index_hex(w, wlen, &x) == 0 &&
+			    x == sc->sc_nvm_eetrack) {
+				nu->nu_eepid = eepid;
+				nu->nu_power = power;
+				return (0);
+			}
+		}
+	}
+
+	return (ENOENT);
+}
+
+/*
+ * Check that the image is intact, is the one the index names, and
+ * that all of its modules are where the update expects them.
+ */
+static int
+ixl_nvm_check_image(struct ixl_nvm_update *nu)
+{
+	const uint8_t *img = nu->nu_img;
+	const struct ixl_nvm_module *m;
+	uint32_t eetrack;
+	uint16_t ptr;
+	size_t i;
+
+	if (nu->nu_imglen < IXL_NVM_SR_WORDS * 2)
+		return (EINVAL);
+	if (ixl_nvm_word(img, IXL_NVM_W_CHECKSUM) != ixl_nvm_checksum(img))
+		return (EINVAL);
+	eetrack = ixl_nvm_word(img, IXL_NVM_W_EETRACK_LO) |
+	    (uint32_t)ixl_nvm_word(img, IXL_NVM_W_EETRACK_HI) << 16;
+	if (eetrack != nu->nu_eepid)
+		return (EINVAL);
+
+	nu->nu_total = 1;	/* header words */
+	for (i = 0; i < nitems(ixl_nvm_modules); i++) {
+		m = &ixl_nvm_modules[i];
+		ptr = ixl_nvm_word(img, m->nm_ptr);
+		if (ptr == 0x0000 || ptr == 0xffff) {
+			if (m->nm_ptr == IXL_NVM_W_EMP_IMAGE)
+				return (EINVAL);
+			continue;
+		}
+		if ((ptr & 0x8000) == 0 ||
+		    ((size_t)(ptr & 0x7fff) + m->nm_sectors) *
+		    IXL_NVM_SECTOR > nu->nu_imglen)
+			return (EINVAL);
+		nu->nu_total += 2 * m->nm_sectors;
+	}
+
+	return (0);
+}
+
+static void
+ixl_nvm_progress(struct ixl_nvm_update *nu)
+{
+	unsigned int pct;
+
+	nu->nu_done++;
+	pct = nu->nu_done * 100 / nu->nu_total / 10 * 10;
+	if (pct != nu->nu_pct) {
+		nu->nu_pct = pct;
+		printf(" %u%%", pct);
+	}
+}
+
+static int
+ixl_nvm_acquire(struct ixl_softc *sc)
+{
+	int i, error;
+
+	for (i = 0; i < 10; i++) {
+		error = ixl_resource_acquire(sc, IXL_AQ_RESOURCE_NVM,
+		    IXL_AQ_RESOURCE_WRITE, IXL_AQ_RESOURCE_NVM_WRITE_TIMEOUT,
+		    0);
+		if (error == 0)
+			break;
+		tsleep_nsec(&nowake, PWAIT, "ixlnvm", SEC_TO_NSEC(1));
+	}
+
+	return (error);
+}
+
+/* Issue NVM_Erase or NVM_Update and wait for its completion. */
+static int
+ixl_nvm_write(struct ixl_softc *sc, struct ixl_nvm_update *nu,
+    uint16_t opcode, uint8_t module, uint8_t flags, uint32_t offset,
+    uint16_t len)
+{
+	struct ixl_aq_desc iaq;
+	struct ixl_dmamem *idm = NULL;
+
+	memset(&iaq, 0, sizeof(iaq));
+	iaq.iaq_opcode = htole16(opcode);
+	if (opcode == IXL_AQ_OP_NVM_UPDATE) {
+		iaq.iaq_datalen = htole16(len);
+		idm = &nu->nu_idm;
+	}
+	/* NVM_Erase takes the offset and length in sectors */
+	iaq.iaq_param[0] = htole32(flags | (uint32_t)module << 8 |
+	    (uint32_t)len << 16);
+	iaq.iaq_param[1] = htole32(offset);
+
+	if (ixl_nvm_aq(sc, &iaq, idm, 1,
+	    (flags & IXL_AQ_NVM_LAST_COMMAND) ? 60000 : 5000) != 0 ||
+	    iaq.iaq_retval != htole16(IXL_AQ_RC_OK))
+		return (EIO);
+
+	return (0);
+}
+
+/*
+ * Write a module outside the shadow RAM: every sector of the module area
+ * is erased in a free provisioning area and then written, the last write
+ * makes the chip switch to the new module (datasheet 3.4.5.4, 3.4.5.5).
+ */
+static int
+ixl_nvm_write_module(struct ixl_softc *sc, struct ixl_nvm_update *nu,
+    const struct ixl_nvm_module *m)
+{
+	const uint8_t *src;
+	uint16_t ptr;
+	unsigned int i;
+	int last, error;
+
+	ptr = ixl_nvm_word(nu->nu_img, m->nm_ptr);
+	if (ptr == 0x0000 || ptr == 0xffff)
+		return (0);
+	src = nu->nu_img + (size_t)(ptr & 0x7fff) * IXL_NVM_SECTOR;
+
+	error = ixl_nvm_acquire(sc);
+	if (error != 0)
+		return (error);
+
+	for (i = 0; i < m->nm_sectors; i++) {
+		last = (i + 1 == m->nm_sectors);
+
+		error = ixl_nvm_write(sc, nu, IXL_AQ_OP_NVM_ERASE,
+		    m->nm_erase, 0, i, 1);
+		if (error != 0)
+			break;
+		ixl_nvm_progress(nu);
+
+		memcpy(IXL_DMA_KVA(&nu->nu_idm), src + i * IXL_NVM_SECTOR,
+		    IXL_NVM_SECTOR);
+		error = ixl_nvm_write(sc, nu, IXL_AQ_OP_NVM_UPDATE, m->nm_ptr,
+		    last ? IXL_AQ_NVM_LAST_COMMAND : 0, i * IXL_NVM_SECTOR,
+		    IXL_NVM_SECTOR);
+		if (error != 0)
+			break;
+		ixl_nvm_progress(nu);
+	}
+
+	/* The firmware no longer answers once EMP Image is written. */
+	if (error != 0 || m->nm_ptr != IXL_NVM_W_EMP_IMAGE)
+		(void)ixl_resource_release(sc, IXL_AQ_RESOURCE_NVM, 0);
+
+	return (error);
+}
+
+/* Write words of the shadow RAM, datasheet 3.4.5.3. */
+static int
+ixl_nvm_write_sr(struct ixl_softc *sc, struct ixl_nvm_update *nu,
+    const uint8_t *sr, unsigned int w, unsigned int nwords, uint8_t flags)
+{
+	memcpy(IXL_DMA_KVA(&nu->nu_idm), sr + w * 2, nwords * 2);
+	return (ixl_nvm_write(sc, nu, IXL_AQ_OP_NVM_UPDATE, 0, flags,
+	    w * 2, nwords * 2));
+}
+
+/*
+ * Copy the version and EETRACK ID of the new image into the NVM header
+ * and fix up the software checksum, so the card reports the new version.
+ */
+static int
+ixl_nvm_write_header(struct ixl_softc *sc, struct ixl_nvm_update *nu)
+{
+	const size_t srlen = IXL_NVM_SR_WORDS * 2;
+	uint8_t *sr;
+	uint16_t sum;
+	int error;
+
+	sr = malloc(srlen, M_DEVBUF, M_WAITOK);
+
+	error = ixl_nvm_acquire(sc);
+	if (error != 0)
+		goto free;
+
+	error = ixl_nvm_read_locked(sc, 0, IXL_NVM_SR_WORDS, (uint16_t *)sr);
+	if (error != 0)
+		goto release;
+
+	memcpy(sr + IXL_NVM_W_DEV_STARTER * 2,
+	    nu->nu_img + IXL_NVM_W_DEV_STARTER * 2, 2);
+	memcpy(sr + IXL_NVM_W_EETRACK_LO * 2,
+	    nu->nu_img + IXL_NVM_W_EETRACK_LO * 2, 4);
+	sum = ixl_nvm_checksum(sr);
+	sr[IXL_NVM_W_CHECKSUM * 2] = sum & 0xff;
+	sr[IXL_NVM_W_CHECKSUM * 2 + 1] = sum >> 8;
+
+	error = ixl_nvm_write_sr(sc, nu, sr, IXL_NVM_W_DEV_STARTER, 1, 0);
+	if (error == 0)
+		error = ixl_nvm_write_sr(sc, nu, sr, IXL_NVM_W_EETRACK_LO, 2,
+		    0);
+	if (error == 0)
+		error = ixl_nvm_write_sr(sc, nu, sr, IXL_NVM_W_CHECKSUM, 1,
+		    IXL_AQ_NVM_LAST_COMMAND);
+	if (error == 0)
+		ixl_nvm_progress(nu);
+
+release:
+	(void)ixl_resource_release(sc, IXL_AQ_RESOURCE_NVM, 0);
+free:
+	free(sr, M_DEVBUF, srlen);
+	return (error);
+}
+
+static int
+ixl_nvm_apply(struct ixl_softc *sc, struct ixl_nvm_update *nu)
+{
+	const struct ixl_nvm_module *m;
+	size_t i;
+	int error;
+
+	for (i = 0; i < nitems(ixl_nvm_modules); i++) {
+		m = &ixl_nvm_modules[i];
+		if (m->nm_ptr == IXL_NVM_W_EMP_IMAGE) {
+			error = ixl_nvm_write_header(sc, nu);
+			if (error != 0)
+				return (error);
+		}
+		error = ixl_nvm_write_module(sc, nu, m);
+		if (error != 0)
+			return (error);
+	}
+
+	return (0);
+}
+
+static void
+ixl_attachhook(struct device *self)
+{
+	struct ixl_softc *sc = (struct ixl_softc *)self;
+	struct ixl_softc *s;
+	struct ixl_nvm_update *nu;
+	char dir[sizeof("ixl-ffff")];
+	char name[sizeof(dir) + sizeof(nu->nu_image)];
+	u_char *idx;
+	size_t idxlen;
+	uint16_t ver;
+	int i, busy = 0, error;
+
+	if (sc->sc_nvm_checked || sc->sc_dead || sc->sc_nvm_eetrack == 0)
+		return;
+	for (i = 0; i < nitems(ixl_nvm_devices); i++) {
+		if (ixl_nvm_devices[i] == sc->sc_pci_product)
+			break;
+	}
+	if (i == nitems(ixl_nvm_devices))
+		return;
+
+	/*
+	 * The ports of a card share the NVM, so only the first one looks
+	 * for an update.  Leave a card alone that is already in use, for
+	 * example for an NFS root file system.
+	 */
+	for (i = 0; i < ixl_cd.cd_ndevs; i++) {
+		s = ixl_cd.cd_devs[i];
+		if (s == NULL || !IXL_SAME_CARD(s, sc))
+			continue;
+		s->sc_nvm_checked = 1;
+		if (ISSET(s->sc_ac.ac_if.if_flags, IFF_UP))
+			busy = 1;
+	}
+	if (busy)
+		return;
+
+	snprintf(dir, sizeof(dir), IXL_NVM_DIR, sc->sc_pci_product);
+	snprintf(name, sizeof(name), "%s/index", dir);
+	error = loadfirmware(name, &idx, &idxlen);
+	if (error != 0) {
+		if (error == ENOENT)
+			printf("%s: firmware %s not installed\n",
+			    DEVNAME(sc), dir);
+		else
+			printf("%s: unable to read firmware %s (error %d)\n",
+			    DEVNAME(sc), name, error);
+		return;
+	}
+
+	nu = malloc(sizeof(*nu), M_DEVBUF, M_WAITOK | M_ZERO);
+	error = ixl_nvm_index_lookup(sc, idx, idxlen, nu);
+	free(idx, M_DEVBUF, idxlen);
+	if (error != 0)
+		goto free;
+
+	snprintf(name, sizeof(name), "%s/%s", dir, nu->nu_image);
+	error = loadfirmware(name, &nu->nu_img, &nu->nu_imglen);
+	if (error != 0) {
+		printf("%s: unable to read firmware %s (error %d)\n",
+		    DEVNAME(sc), name, error);
+		goto free;
+	}
+	if (ixl_nvm_check_image(nu) != 0) {
+		printf("%s: firmware %s is not a valid NVM image\n",
+		    DEVNAME(sc), name);
+		goto free_img;
+	}
+	if (ixl_dmamem_alloc(sc, &nu->nu_idm, IXL_NVM_SECTOR, 0) != 0) {
+		printf("%s: unable to allocate NVM buffer\n", DEVNAME(sc));
+		goto free_img;
+	}
+
+	ver = ixl_nvm_word(nu->nu_img, IXL_NVM_W_DEV_STARTER);
+	printf("%s: updating NVM %x.%02x to %x.%02x:", DEVNAME(sc),
+	    sc->sc_nvm_version >> 12, sc->sc_nvm_version & 0xff,
+	    ver >> 12, ver & 0xff);
+
+	error = ixl_nvm_apply(sc, nu);
+
+	ixl_dmamem_free(sc, &nu->nu_idm);
+
+	if (error != 0) {
+		printf(" failed\n");
+		goto free_img;
+	}
+	printf(" done\n");
+
+	for (i = 0; i < ixl_cd.cd_ndevs; i++) {
+		s = ixl_cd.cd_devs[i];
+		if (s == NULL || !IXL_SAME_CARD(s, sc))
+			continue;
+		rw_enter_write(&s->sc_cfg_lock);
+		s->sc_dead = 1;
+		rw_exit_write(&s->sc_cfg_lock);
+		printf("%s: %s REQUIRED AFTER FIRMWARE\n",
+		    DEVNAME(s), nu->nu_power ? "POWER CYCLE" : "REBOOT");
+	}
+
+free_img:
+	free(nu->nu_img, M_DEVBUF, nu->nu_imglen);
+free:
+	free(nu, M_DEVBUF, sizeof(*nu));
+}
+#endif /* SMALL_KERNEL */
 
 #if NKSTAT > 0
 
