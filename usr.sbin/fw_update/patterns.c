@@ -113,6 +113,15 @@ main(void)
 	printf("%s\n", "iwm");
 	printf("%s\n", "iwn");
 	printf("%s\n", "iwx");
+	printf("%s\n", "ixl-1572 ^ixl[0-9]*firmware ixl-1572 not installed");
+	printf("%s\n", "ixl-1580 ^ixl[0-9]*firmware ixl-1580 not installed");
+	printf("%s\n", "ixl-1581 ^ixl[0-9]*firmware ixl-1581 not installed");
+	printf("%s\n", "ixl-1583 ^ixl[0-9]*firmware ixl-1583 not installed");
+	printf("%s\n", "ixl-1584 ^ixl[0-9]*firmware ixl-1584 not installed");
+	printf("%s\n", "ixl-158a ^ixl[0-9]*firmware ixl-158a not installed");
+	printf("%s\n", "ixl-158b ^ixl[0-9]*firmware ixl-158b not installed");
+	printf("%s\n", "ixl-15ff ^ixl[0-9]*firmware ixl-15ff not installed");
+	printf("%s\n", "ixl-37d0 ^ixl[0-9]*firmware ixl-37d0 not installed");
 	printf("%s\n", "malo");
 	printf("%s\n", "mtw");
 	printf("%s\n", "mwx");
